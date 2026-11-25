@@ -35,7 +35,7 @@
 //!   `VirtualProtect` fail with error 87), nor unmap a view in it. Pages
 //!   outside the opened part are free to change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -264,6 +264,62 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 // census needs them to say which view memory is one run of a section (one
 // placed buffer could show it) and which is scattered pages.
 
+/// Addresses of views showing one 64 KiB physical page. Nearly every page is
+/// mapped in only one view, so store a single address inline with zero heap
+/// allocation and promote to a `BTreeSet` only when aliased.
+enum PageSet {
+    One(usize),
+    Many(BTreeSet<usize>),
+}
+
+impl PageSet {
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(set) => set.len(),
+        }
+    }
+
+    fn insert(&mut self, addr: usize) {
+        match self {
+            Self::One(only) if *only == addr => {}
+            Self::One(only) => {
+                let mut set = BTreeSet::new();
+                set.insert(*only);
+                set.insert(addr);
+                *self = Self::Many(set);
+            }
+            Self::Many(set) => {
+                set.insert(addr);
+            }
+        }
+    }
+
+    /// Removes `addr`; returns true if the set is now empty.
+    fn remove(&mut self, addr: usize) -> bool {
+        match self {
+            Self::One(only) => *only == addr,
+            Self::Many(set) => {
+                set.remove(&addr);
+                if set.len() == 1 {
+                    let only = *set.iter().next().unwrap();
+                    *self = Self::One(only);
+                    false
+                } else {
+                    set.is_empty()
+                }
+            }
+        }
+    }
+
+    fn to_vec(&self) -> Vec<usize> {
+        match self {
+            Self::One(only) => vec![*only],
+            Self::Many(set) => set.iter().copied().collect(),
+        }
+    }
+}
+
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
@@ -271,7 +327,7 @@ struct Views {
     /// page in every view that shows it. A write through one view of a
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
-    pages: BTreeMap<(usize, u64), Vec<usize>>,
+    pages: BTreeMap<(usize, u64), PageSet>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
 }
@@ -298,7 +354,14 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         let mut v = views();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
-            v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
+            let key = (section, offset + (k * K64) as u64);
+            let addr = at + k * K64;
+            match v.pages.get_mut(&key) {
+                Some(set) => set.insert(addr),
+                None => {
+                    v.pages.insert(key, PageSet::One(addr));
+                }
+            }
         }
     }
     // This view is writable from now on: a guard over the same bytes at
@@ -326,8 +389,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             let key = (section, offset + (k * K64) as u64);
             if let Some(pages) = v.pages.get_mut(&key) {
                 let page = base + k * K64;
-                pages.retain(|&shown| shown != page);
-                if pages.is_empty() {
+                if pages.remove(page) {
                     v.pages.remove(&key);
                 }
             }
@@ -335,20 +397,41 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
+/// For every 64 KiB page of a mapped view in `[start, end)` whose physical
+/// page is shown in between 2 and `max_views` views, returns `(page_addr, all_views)`.
+/// Checks `len` before allocating so single-view pages and filler pages
+/// (thousands of views) incur zero heap allocation under a single lock.
+pub(crate) fn aliased_pages_in(start: usize, end: usize, max_views: usize) -> Vec<(usize, Vec<usize>)> {
     if start >= end {
         return Vec::new();
     }
     let v = views();
     let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+    let mut visit = |base: usize, bytes: usize, section: usize, offset: u64| {
+        let first = base.max(start - start % K64);
+        let last = base.saturating_add(bytes).min(end);
+        let mut page = first;
+        while page < last {
+            let within = page - base;
+            if let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                && shown.len() >= 2
+                && shown.len() <= max_views
+            {
+                out.push((page, shown.to_vec()));
+            }
+            match page.checked_add(K64) {
+                Some(next) => page = next,
+                None => break,
+            }
+        }
+    };
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
         && base + bytes > start
     {
-        out.push((base, bytes));
+        visit(base, bytes, section, offset);
     }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        visit(base, bytes, section, offset);
     }
     out
 }
@@ -364,7 +447,10 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     if within >= bytes || !within.is_multiple_of(K64) {
         return Vec::new();
     }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+    v.pages
+        .get(&(section, offset + within as u64))
+        .map(PageSet::to_vec)
+        .unwrap_or_default()
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -382,7 +468,10 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
         if let Some(shown) = v.pages.get(&(section, at))
             && shown.len() <= crate::watch::MANY_VIEWS
         {
-            pages.extend(shown.iter().copied());
+            match shown {
+                PageSet::One(only) => pages.push(*only),
+                PageSet::Many(set) => pages.extend(set.iter().copied()),
+            }
         }
         match at.checked_add(K64 as u64) {
             Some(next) => at = next,
