@@ -146,7 +146,7 @@ void main(uint3 at : SV_DispatchThreadID) {
     float peak = max(existing.r, max(existing.g, existing.b));
     // Reject NaN/Inf/spikes and uninitialized magenta probe garbage while keeping
     // valid brighter bounce (such as sky/water scatter).
-    bool garbage = (peak != peak) || peak > 64.0
+    bool garbage = (peak != peak) || peak > 32768.0
         || (existing.r > existing.g * 2.2 + 0.05 && existing.b > existing.g * 2.2 + 0.05);
     light[at.xy] = pack(garbage ? floor_light : max(existing, floor_light));
 }
