@@ -5,6 +5,7 @@
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
 
+pub mod batch;
 pub mod config;
 pub mod logging;
 pub mod policy;

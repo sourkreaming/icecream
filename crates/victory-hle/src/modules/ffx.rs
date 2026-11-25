@@ -89,11 +89,17 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 );
             }
             #[cfg(windows)]
-            if victory_gpu::list::upscale_stretch(
+            if victory_gpu::list::upscale_with_inputs(
                 d.list,
                 d.colour.resource,
+                d.depth.resource,
+                d.motion.resource,
+                d.exposure.resource,
                 d.output.resource,
+                d.jitter,
+                d.motion_scale,
                 d.render,
+                d.upscale,
             ) {
                 return 0;
             }

@@ -82,6 +82,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Bytes reserved in `crate::rebar` (0 if not placed in GPU upload heap).
+    rebar: u64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1909,6 +1911,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.rebar != 0 {
+            crate::rebar::released(self.rebar);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2234,6 +2239,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the shadow buffer is backed in place over title memory.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -2304,6 +2314,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            rebar: 0,
         }
     }
 
@@ -3620,6 +3631,10 @@ fn lookup(address: u64, len: u64, any: bool, writable: bool) -> Option<Arc<Shado
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        if !big && let Some(shadow) = rebar_copy(crate::rebar::Kind::Buffer, key.0, len, size, false) {
+            entry.shadow = Some(shadow);
+            return entry.shadow.clone();
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -3824,7 +3839,34 @@ fn overlaps_buffer(start: u64, len: u64) -> bool {
         .any(|(_, e)| e.end > start)
 }
 
+/// A host copy in CPU-visible card memory (`D3D12_HEAP_TYPE_GPU_UPLOAD`,
+/// `crate::rebar`), if enabled, supported and within budget.
+fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
+    if !crate::rebar::reserve(kind, size, false) {
+        return None;
+    }
+    let Some((buffer, data)) = host()?.gpu_upload_buffer(size) else {
+        crate::rebar::released(size);
+        return None;
+    };
+    crate::host::name(&buffer, || {
+        format!(
+            "title {} {start:#x}+{len:#x} (rebar)",
+            if window { "memory" } else { "buffer" }
+        )
+    });
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = window;
+    shadow.rebar = size;
+    Some(Arc::new(shadow))
+}
+
 fn make_loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    if let Some(shadow) = rebar_copy(crate::rebar::Kind::Window, start, len, len, true) {
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a

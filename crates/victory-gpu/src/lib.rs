@@ -42,6 +42,8 @@ pub mod pipeline;
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod rebar;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -52,6 +54,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod streamline;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

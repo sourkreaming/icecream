@@ -13,6 +13,16 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Outcome of [`HostHeap::mirror_buffer`] for incremental heap-buffer passes.
+pub(crate) enum BufferMirror {
+    /// Slot still mirrors `cached_key` and its title resource is still live.
+    Unchanged,
+    /// Slot was newly mirrored or changed to `(key, view)`.
+    Changed(u64, View),
+    /// Slot is empty or no longer valid.
+    Empty,
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -65,8 +75,9 @@ pub(crate) struct HostHeap {
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
-    /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    /// buffers from the whole heap. Partitioned into 64 buckets by `index & 63`
+    /// so rolling heap passes only clone 1/64th of the slots per frame.
+    buffers: Mutex<[std::collections::HashSet<u32>; 64]>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -975,7 +986,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             view_addresses,
-            buffers: Mutex::default(),
+            buffers: Mutex::new(std::array::from_fn(|_| std::collections::HashSet::new())),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -1586,7 +1597,18 @@ impl HostHeap {
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        let total: usize = buffers.iter().map(std::collections::HashSet::len).sum();
+        let mut out = Vec::with_capacity(total);
+        for bucket in buffers.iter() {
+            out.extend(bucket.iter().copied());
+        }
+        out
+    }
+
+    /// The title slots in rolling bucket `bucket & 63` that hold buffer views.
+    pub(crate) fn buffer_slots_bucket(&self, bucket: u32) -> Vec<u32> {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers[(bucket & 63) as usize].iter().copied().collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -1594,35 +1616,6 @@ impl HostHeap {
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *changed).into_iter().collect()
-    }
-
-    /// Filters `candidates` (slots already cached in `heap_buffers`'s `ranges`),
-    /// returning only those whose title descriptor changed, disappeared, or whose
-    /// underlying view entry is no longer live. Takes `self.made` lock once.
-    pub(crate) fn stale_buffer_slots(&self, heap: &super::Heap, candidates: &[u32]) -> Vec<u32> {
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stale = Vec::new();
-        for &index in candidates {
-            if index >= self.count {
-                stale.push(index);
-                continue;
-            }
-            let Some(handle) = heap.handle(index) else {
-                stale.push(index);
-                continue;
-            };
-            // SAFETY: `handle` points to a descriptor slot in title memory.
-            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-            let key = u64::from(generation) << 32 | u64::from(i);
-            let same = tag == VIEW_TAG
-                && made[index as usize] != 0
-                && made[index as usize] == key
-                && view_at(i, generation).is_some();
-            if !same {
-                stale.push(index);
-            }
-        }
-        stale
     }
 
     /// Records what title slot `index` now holds for shaders that pick
@@ -1716,11 +1709,12 @@ impl HostHeap {
             }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let slot_bucket = &mut buffers[(index & 63) as usize];
         let was = if stride.is_some() {
-            buffers.insert(index);
+            slot_bucket.insert(index);
             true
         } else {
-            buffers.remove(&index)
+            slot_bucket.remove(&index)
         };
         if was {
             self.changed
@@ -1943,6 +1937,33 @@ impl HostHeap {
         }
         self.mirror(index, handle, false);
         true
+    }
+
+    /// Like [`HostHeap::mirror`] with `for_draw = true`, but returns
+    /// [`BufferMirror::Unchanged`] without rebuilding or re-resolving the
+    /// host copy when slot `index` still holds `cached_key` (`!= 0`), its
+    /// title view is still live, and the host heap already mirrors that key.
+    pub(crate) fn mirror_buffer(&self, index: u32, handle: u64, cached_key: u64) -> BufferMirror {
+        if cached_key != 0 && index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG && key == cached_key && view_at(i, generation).is_some() {
+                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                if made[index as usize] == key {
+                    return BufferMirror::Unchanged;
+                }
+            }
+        }
+        match self.mirror(index, handle, true) {
+            Some(view) => {
+                // SAFETY: `mirror` just read this descriptor slot.
+                let [_, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let key = u64::from(generation) << 32 | u64::from(i);
+                BufferMirror::Changed(key, view)
+            }
+            None => BufferMirror::Empty,
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`

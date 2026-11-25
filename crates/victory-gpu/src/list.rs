@@ -140,17 +140,67 @@ const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
-/// is a host GPU.
+/// is a host GPU, after flushing any held indirect run and bumping the
+/// state epoch.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    with_state_how(this, false, f);
+}
+
+#[cfg(windows)]
+fn with_state_how(
+    this: This,
+    indirect_or_reset: bool,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    if !indirect_or_reset {
+        state.touched(list);
+    }
+    f(list, &mut state);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
+}
+
+/// Flushes any held indirect run and bumps the state epoch before recording
+/// outside [`with_state`] (barriers, copies, clears, writes).
+#[cfg(windows)]
+fn flush_held(this: This) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let l = unsafe { &*this.cast::<List>() };
+    let Some(host) = l.host.as_ref() else { return };
+    if let Ok(mut state) = l.state.try_lock() {
+        state.touched(host);
+    }
+}
+
+/// Before closing or cutting a host list: flushes any held indirect run and
+/// transitions any active window's scratch buffer back to `COMMON`.
+#[cfg(windows)]
+fn finish_list(this: This) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let l = unsafe { &*this.cast::<List>() };
+    let Some(host) = l.host.as_ref() else { return };
+    l.state.lock().unwrap_or_else(|e| e.into_inner()).finish_list(host);
+}
+
+/// [`host_list`] for recording commands outside [`with_state`]: flushes held
+/// indirect runs first.
+#[cfg(windows)]
+fn host_list_rec<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    flush_held(this);
+    host_list(this)
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -300,6 +350,7 @@ fn cut(this: This, wait: ValueWait) {
     if this.is_null() {
         return;
     }
+    flush_held(this);
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -623,10 +674,12 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        state.flush_window(host);
-        host.close();
-    });
+    {
+        finish_list(this);
+        if let Some(host) = host_list(this) {
+            host.close();
+        }
+    }
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -653,7 +706,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
+    with_state_how(this, true, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
@@ -796,7 +849,7 @@ fn emit_barriers(list: &crate::host::HostList, host: &[Barrier]) {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = host_list_rec(this)
         && !barriers.is_null()
         && count > 0
     {
@@ -879,12 +932,46 @@ pub fn upscale_stretch(
     output: *const std::ffi::c_void,
     render: [u32; 2],
 ) -> bool {
+    upscale_with_inputs(
+        this,
+        colour,
+        std::ptr::null(),
+        std::ptr::null(),
+        std::ptr::null(),
+        output,
+        [0.0, 0.0],
+        [1.0, 1.0],
+        render,
+        render,
+    )
+}
+
+/// Stands in for the console upscaler's dispatch on title list `this`:
+/// evaluates Streamline DLSS Super Resolution / tags DLSS-G depth & motion
+/// when enabled (`VICTORY_DLSS` / `VICTORY_DLSS_FG`), or falls back to
+/// stretching the top-left `render` texels of `colour` ([`crate::over`]).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+pub fn upscale_with_inputs(
+    this: *const std::ffi::c_void,
+    colour: *const std::ffi::c_void,
+    depth: *const std::ffi::c_void,
+    motion: *const std::ffi::c_void,
+    exposure: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    render: [u32; 2],
+    upscale: [u32; 2],
+) -> bool {
     const SHADER_READ: u32 = 0x40;
     const UNORDERED: u32 = 0x8;
     let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
     if this.is_null() || colour.is_null() || output.is_null() {
         return false;
     }
+    let (depth_res, motion_res, exposure_res): (This, This, This) =
+        (depth.cast(), motion.cast(), exposure.cast());
     let mut done = false;
     with_state(this, |list, state| {
         let (Some(to), Some(from), Some(host)) = (
@@ -896,7 +983,49 @@ pub fn upscale_stretch(
         };
         ensure_state(list, colour, SHADER_READ);
         ensure_state(list, output, UNORDERED);
-        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
+        if crate::streamline::active() {
+            let mut d_in = None;
+            if !depth_res.is_null()
+                && let Some(d_host) = crate::resource::host_resource(depth_res)
+            {
+                ensure_state(list, depth_res, SHADER_READ);
+                d_in = Some((d_host, crate::host::legal_state(d_host, SHADER_READ)));
+            }
+            let mut m_in = None;
+            if !motion_res.is_null()
+                && let Some(m_host) = crate::resource::host_resource(motion_res)
+            {
+                ensure_state(list, motion_res, SHADER_READ);
+                m_in = Some((m_host, crate::host::legal_state(m_host, SHADER_READ)));
+            }
+            let mut e_in = None;
+            if !exposure_res.is_null()
+                && let Some(e_host) = crate::resource::host_resource(exposure_res)
+            {
+                ensure_state(list, exposure_res, SHADER_READ);
+                e_in = Some((e_host, crate::host::legal_state(e_host, SHADER_READ)));
+            }
+            let c_state = crate::host::legal_state(from, SHADER_READ);
+            let o_state = crate::host::legal_state(to, UNORDERED);
+            let inputs = crate::streamline::UpscaleInputs {
+                list: &list.list,
+                colour: from,
+                colour_state: c_state,
+                depth: d_in,
+                motion: m_in,
+                exposure: e_in,
+                output: to,
+                output_state: o_state,
+                jitter,
+                motion_scale,
+                render,
+                upscale,
+            };
+            done = crate::streamline::evaluate_dlss_or_tag(&inputs);
+        }
+        if !done {
+            done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
+        }
         if done {
             crate::texture::host_written(output);
         }
@@ -945,7 +1074,7 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = host_list_rec(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
@@ -984,7 +1113,7 @@ fn unlike(dst: This, src: This, from_buffer: bool) -> bool {
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
-        let Some(list) = host_list(this) else {
+        let Some(list) = host_list_rec(this) else {
             return;
         };
         if let (Some(to), Some(from)) = (
@@ -1056,7 +1185,7 @@ extern "system" fn copy_texture_region(
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
+            (host_list_rec(this), unsafe { dst.as_ref() }, unsafe {
                 src.as_ref()
             })
         else {
@@ -1319,7 +1448,7 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = host_list_rec(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1396,7 +1525,7 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
+        let (Some(list), Some(record)) = (host_list_rec(this), crate::descriptor::rtv_record(handle))
         else {
             return;
         };
@@ -1447,7 +1576,7 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-        let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
+        let (Some(list), Some(record)) = (host_list_rec(this), crate::descriptor::dsv_record(handle))
         else {
             return;
         };
@@ -1484,7 +1613,7 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if let Some(list) = host_list_rec(this)
         && dst != 0
         && src != 0
     {
@@ -1896,7 +2025,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_state_how(this, true, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
@@ -2139,7 +2268,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     #[cfg(windows)]
     if count > 0
         && !groups.is_null()
-        && let Some(list) = host_list(this)
+        && let Some(list) = host_list_rec(this)
     {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_GROUP, D3D12_BUFFER_BARRIER,
@@ -2343,6 +2472,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(fresh) = fresh_list() else {
             return;
         };
+        flush_held(this);
         list.state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2370,7 +2500,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     #[cfg(windows)]
-    if let Some(list) = host_list(this) {
+    if let Some(list) = host_list_rec(this) {
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }
