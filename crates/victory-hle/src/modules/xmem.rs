@@ -71,8 +71,6 @@ const GRAPHICS: u64 = 3;
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
-/// Coalesces adjacent placeholders in `VirtualFree` (not in windows-sys' memory module).
-const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
@@ -974,7 +972,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
                 MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
             );
             MapViewOfFile3(
-                slice.section.0,
+                section.handle,
                 GetCurrentProcess(),
                 base as *const c_void,
                 (slice.index * PAGE) as u64,
@@ -988,7 +986,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         if view.Value as usize != base {
             for k in 0..len.div_ceil(PAGE) {
                 let page_slice = Slice {
-                    section: slice.section.clone(),
+                    chunk: slice.chunk.clone(),
                     index: slice.index + k,
                 };
                 if !map(physical, base + k * PAGE, PAGE, page_slice) {
