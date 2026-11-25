@@ -239,11 +239,20 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    filters: Vec<String>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
-    // at most 32 lanes (as the runtime does on such a card).
-    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+    let filters: Vec<String> = filters
+        .into_iter()
+        .flat_map(|s| s.split(',').map(|t| t.trim().to_lowercase()).collect::<Vec<_>>())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // `VICTORY_HOST_MAX_WAVE=32` / `VICTORY_HOST_WAVE=32`: translate as for a
+    // host whose waves have at most 32 lanes (as the runtime does on such a card).
+    if let Some(n) = ["VICTORY_HOST_MAX_WAVE", "VICTORY_HOST_WAVE"]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok().and_then(|v| v.parse().ok()))
+    {
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
@@ -299,7 +308,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, entry.path(), &filters, &seen, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -390,17 +399,43 @@ pub fn run(
 fn translate(
     source: &Source,
     path: &Path,
+    filters: &[String],
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
+    fn hex_prefix(f: &str) -> Option<&str> {
+        let s = f.strip_prefix('#').or_else(|| f.strip_prefix('~')).unwrap_or(f);
+        (s.len() >= 4 && s.bytes().all(|b| b.is_ascii_hexdigit())).then_some(s)
+    }
+    let label_match = if filters.is_empty() {
+        true
+    } else {
+        let label = source.label().to_lowercase();
+        if filters.iter().any(|f| label.contains(f.as_str())) {
+            true
+        } else if !filters.iter().any(|f| hex_prefix(f).is_some()) {
+            return;
+        } else {
+            false
+        }
+    };
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    if !filters.is_empty()
+        && !label_match
+        && !filters
+            .iter()
+            .filter_map(|f| hex_prefix(f))
+            .any(|p| hash.starts_with(p))
+    {
+        return;
+    }
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();

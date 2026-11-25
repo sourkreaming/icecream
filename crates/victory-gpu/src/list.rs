@@ -318,6 +318,10 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     };
+    list.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .flush_window(current);
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
@@ -619,9 +623,10 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
+    with_state(this, |host, state| {
+        state.flush_window(host);
         host.close();
-    }
+    });
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
@@ -736,43 +741,168 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+#[cfg(windows)]
+fn push_uav_raw(host: &mut Vec<Barrier>, raw: This) {
+    if !host.iter().any(|b| b.kind == 2 && b.first == raw) {
+        host.push(Barrier {
+            kind: 2,
+            flags: 0,
+            first: raw,
+            second: 0,
+            last: 0,
+        });
+    }
+}
+
+#[cfg(windows)]
+fn push_uav_target(
+    host: &mut Vec<Barrier>,
+    kept: &mut Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    resource: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::core::Interface;
+    let raw = resource.as_raw().cast_const().cast();
+    if !host.iter().any(|b| b.kind == 2 && b.first == raw) {
+        kept.push(resource);
+        host.push(Barrier {
+            kind: 2,
+            flags: 0,
+            first: raw,
+            second: 0,
+            last: 0,
+        });
+    }
+}
+
+#[cfg(windows)]
+fn emit_barriers(list: &crate::host::HostList, host: &[Barrier]) {
+    if host.is_empty() {
+        return;
+    }
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+    // SAFETY: the same layout; borrowed resource pointers, never
+    // released through this slice.
+    let host = unsafe {
+        std::slice::from_raw_parts(
+            host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+            host.len(),
+        )
+    };
+    // SAFETY: an open list and live resources.
+    unsafe { list.list.ResourceBarrier(host) };
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
+        && count > 0
     {
+        const BEGIN_ONLY: u32 = 1;
+        const UNORDERED_ACCESS: u32 = 0x8;
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
+        let mut host: Vec<Barrier> = Vec::with_capacity(barriers.len());
+        let mut kept = Vec::new();
+        let mut needs_global = false;
+        #[cfg(feature = "diagnostics")]
+        let mut buffer_waited = false;
+        for b in barriers {
+            if b.kind == 0 && b.flags & BEGIN_ONLY != 0 {
+                continue;
+            }
+            if b.kind == 2 && b.first.is_null() {
+                needs_global = true;
+                continue;
+            }
+            if let Some(hb) = host_barrier(list, b) {
+                host.push(hb);
+                continue;
+            }
+            if b.kind != 1
+                && !b.first.is_null()
+                && let Some((ptr, len)) = crate::resource::buffer_bytes(b.first)
+            {
+                let (is_uav_before, is_uav_after) = if b.kind == 0 {
+                    let before = (b.second >> 32) as u32;
+                    let after = b.last as u32;
+                    (before & UNORDERED_ACCESS != 0, after & UNORDERED_ACCESS != 0)
+                } else {
+                    (true, true)
+                };
+                if !is_uav_before {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    buffer_waited = true;
+                }
+                if is_uav_after {
+                    if list.uav_dirty() {
+                        if let Some(shadow_res) = list.existing_shadow(ptr as u64, len) {
+                            push_uav_target(&mut host, &mut kept, shadow_res);
+                        } else {
+                            needs_global = true;
+                        }
+                    }
+                } else {
+                    needs_global = true;
+                }
+            }
+        }
+        if needs_global && list.uav_dirty() {
             host.push(UAV_BARRIER);
+            list.clear_uav_dirty();
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            if buffer_waited {
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
         }
-        if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
-        }
+        emit_barriers(list, &host);
     }
     0
+}
+
+/// Stands in for the console upscaler's dispatch on title list `this`:
+/// `output` gets the stretched top-left `render` texels of `colour`
+/// ([`crate::over`]). False if nothing was recorded (no host GPU, textures
+/// we do not hold, an output shaders cannot write).
+///
+/// The real dispatch leaves its own state in the list, so the title sets
+/// its own again afterwards; ours is replayed all the same.
+#[cfg(windows)]
+pub fn upscale_stretch(
+    this: *const std::ffi::c_void,
+    colour: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    render: [u32; 2],
+) -> bool {
+    const SHADER_READ: u32 = 0x40;
+    const UNORDERED: u32 = 0x8;
+    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
+    if this.is_null() || colour.is_null() || output.is_null() {
+        return false;
+    }
+    let mut done = false;
+    with_state(this, |list, state| {
+        let (Some(to), Some(from), Some(host)) = (
+            crate::resource::host_resource(output),
+            crate::resource::host_resource(colour),
+            crate::host::host(),
+        ) else {
+            return;
+        };
+        ensure_state(list, colour, SHADER_READ);
+        ensure_state(list, output, UNORDERED);
+        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
+        if done {
+            crate::texture::host_written(output);
+        }
+        state.replay(list);
+    });
+    done
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
@@ -829,7 +959,18 @@ extern "system" fn copy_buffer_region(
 /// other is not ([`crate::resource::target_format`]): their texels differ
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
-fn unlike(dst: This, src: This) -> bool {
+fn unlike(dst: This, src: This, from_buffer: bool) -> bool {
+    // A host copy without its largest levels has other subresources and
+    // sizes than the title's texture (`crate::resource::drop_levels`): a
+    // copy from a buffer into it goes to the level it has
+    // (`crate::resource::host_subresource`), any other is skipped.
+    if crate::resource::dropped(src) > 0 || (!from_buffer && crate::resource::dropped(dst) > 0) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out levels skipped")
+        });
+        return true;
+    }
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -850,7 +991,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if unlike(dst, src, false) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -955,8 +1096,17 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        if unlike(dst.resource, src.resource, src.kind == FOOTPRINT) {
             return;
+        }
+        // Into a host copy without its largest levels: the level it has,
+        // or nothing (`crate::resource::drop_levels`).
+        let mut dst = dst;
+        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource) > 0 {
+            match crate::resource::host_subresource(dst.resource, dst.footprint.offset as u32) {
+                Some(index) => dst.footprint.offset = u64::from(index),
+                None => return,
+            }
         }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
@@ -969,19 +1119,50 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
+            let addr = data as u64;
+            let direct = crate::shadow::find(addr, bytes)
+                .filter(|shadow| shadow.left(addr) >= bytes)
+                .and_then(|shadow| {
+                    if let Some(offset) = shadow.offset_in(addr)
+                        && offset.is_multiple_of(512)
+                    {
+                        shadow.refresh(list, addr, bytes);
+                        if list.uav_dirty() {
+                            // SAFETY: `list` is open; synchronize any preceding shader writes to `shadow.buffer`.
+                            unsafe {
+                                list.list
+                                    .ResourceBarrier(&[crate::host::uav_barrier(Some(&shadow.buffer))])
+                            };
+                        }
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { shadow.buffer.GetGPUVirtualAddress() } + offset;
+                        Some((shadow.buffer.clone(), offset, gpu))
+                    } else {
+                        list.gpu_copy_from_shadow(&shadow, addr, bytes, 512)
+                    }
+                });
+            let (buffer, offset, gpu) = match direct {
+                Some(pair) => pair,
+                None => {
+                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                        return;
+                    };
+                    // The list owns this mapped D3D12 upload buffer. Wine can report
+                    // its address as MEM_FREE, so use the host-upload path.
+                    list.defer_fill(staging, data, bytes as usize);
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    (buffer, 0, gpu)
+                }
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = offset;
             #[cfg(feature = "diagnostics")]
             {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((gpu, bytes));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = gpu;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -1079,6 +1260,9 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
+    if crate::resource::dropped(src.resource) > 0 {
+        return Err("a texture whose host copy leaves out levels");
+    }
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1149,7 +1333,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src) {
+        if unlike(dst, src, false) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
@@ -1323,14 +1507,16 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: a compute dispatch with console
+/// `COMPUTE_DISPATCH_INITIATOR` flags (bit 5, `0x20`, is
+/// `USE_THREAD_DIMENSIONS`: `(x, y, z)` are raw thread counts rather than
+/// thread-group counts).
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1590,6 +1776,10 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
+    }
+    pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1937,29 +2127,161 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+/// first, so only their ordering matters: targeted UAV barriers for
+/// UAV-written textures and existing buffer shadows, and a global UAV barrier
+/// only when a remaining UAV->read barrier needs it while `uav_dirty` is set.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if count > 0 {
-        crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
+    if count > 0 && crate::copystat::barrier_test() & 1 != 0 {
+        return;
     }
     #[cfg(windows)]
     if count > 0
+        && !groups.is_null()
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_GROUP, D3D12_BUFFER_BARRIER,
+            D3D12_GLOBAL_BARRIER, D3D12_TEXTURE_BARRIER,
+        };
+        use windows::core::Interface;
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct BarrierGroup {
+            kind: u32,
+            count: u32,
+            barriers: *const u8,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct GlobalBarrier {
+            sync_before: u32,
+            sync_after: u32,
+            access_before: u32,
+            access_after: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TextureBarrier {
+            sync_before: u32,
+            sync_after: u32,
+            access_before: u32,
+            access_after: u32,
+            layout_before: u32,
+            layout_after: u32,
+            resource: This,
+            subresources: [u32; 6],
+            flags: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct BufferBarrier {
+            sync_before: u32,
+            sync_after: u32,
+            access_before: u32,
+            access_after: u32,
+            resource: This,
+            offset: u64,
+            size: u64,
+        }
+        const _: () = assert!(size_of::<BarrierGroup>() == size_of::<D3D12_BARRIER_GROUP>());
+        const _: () = assert!(size_of::<GlobalBarrier>() == size_of::<D3D12_GLOBAL_BARRIER>());
+        const _: () = assert!(size_of::<TextureBarrier>() == size_of::<D3D12_TEXTURE_BARRIER>());
+        const _: () = assert!(size_of::<BufferBarrier>() == size_of::<D3D12_BUFFER_BARRIER>());
+        const UAV_ACCESS: u32 = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 as u32;
+
+        // SAFETY: the title passes `count` 16-byte barrier groups.
+        let groups =
+            unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+        let mut host: Vec<Barrier> = Vec::new();
+        let mut kept = Vec::new();
+        let mut needs_global = false;
+        for g in groups {
+            if g.count == 0 || g.barriers.is_null() {
+                continue;
+            }
+            match g.kind {
+                0 => {
+                    // SAFETY: global barrier group with `g.count` elements.
+                    let globals = unsafe {
+                        std::slice::from_raw_parts(
+                            g.barriers.cast::<GlobalBarrier>(),
+                            g.count as usize,
+                        )
+                    };
+                    if globals.iter().any(|b| b.access_before & UAV_ACCESS != 0) {
+                        needs_global = true;
+                    }
+                }
+                1 => {
+                    // SAFETY: texture barrier group with `g.count` elements.
+                    let textures = unsafe {
+                        std::slice::from_raw_parts(
+                            g.barriers.cast::<TextureBarrier>(),
+                            g.count as usize,
+                        )
+                    };
+                    for t in textures {
+                        if t.access_before & UAV_ACCESS == 0 || t.resource.is_null() {
+                            continue;
+                        }
+                        let target = crate::resource::twin_resource(t.resource)
+                            .map(|twin| twin.as_raw().cast_const().cast())
+                            .or_else(|| {
+                                crate::resource::host_resource(t.resource)
+                                    .map(|h| h.as_raw().cast_const().cast())
+                            });
+                        if let Some(raw) = target {
+                            push_uav_raw(&mut host, raw);
+                        }
+                    }
+                }
+                2 => {
+                    // SAFETY: buffer barrier group with `g.count` 40-byte elements.
+                    let buffers = unsafe {
+                        std::slice::from_raw_parts(
+                            g.barriers.cast::<BufferBarrier>(),
+                            g.count as usize,
+                        )
+                    };
+                    for b in buffers {
+                        if b.access_before & UAV_ACCESS == 0 {
+                            continue;
+                        }
+                        if b.resource.is_null() {
+                            needs_global = true;
+                            continue;
+                        }
+                        let Some((ptr, len)) = crate::resource::buffer_bytes(b.resource) else {
+                            continue;
+                        };
+                        if b.access_after & UAV_ACCESS != 0 {
+                            if list.uav_dirty() {
+                                if let Some(shadow_res) = list.existing_shadow(ptr as u64, len) {
+                                    push_uav_target(&mut host, &mut kept, shadow_res);
+                                } else {
+                                    needs_global = true;
+                                }
+                            }
+                        } else {
+                            needs_global = true;
+                        }
+                    }
+                }
+                _ => needs_global = true,
+            }
+        }
+        if needs_global && list.uav_dirty() {
+            host.push(UAV_BARRIER);
+            list.clear_uav_dirty();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        }
+        emit_barriers(list, &host);
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2021,7 +2343,11 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(fresh) = fresh_list() else {
             return;
         };
-        current.close();
+        list.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .flush_window(current);
+    current.close();
         if let Some(done) = list.host.replace(fresh) {
             // The part so far keeps its waits; nothing stands before the
             // next one but this part itself.

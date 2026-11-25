@@ -84,6 +84,10 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Only translate containers whose label or hash matches a pattern
+        /// (case-insensitive substring or hash prefix; repeatable or comma-separated).
+        #[arg(long)]
+        filter: Vec<String>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
@@ -159,6 +163,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            filter,
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -172,7 +177,12 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            let filters: Vec<String> = filter
+                .into_iter()
+                .flat_map(|s| s.split(',').map(|t| t.trim().to_owned()).collect::<Vec<_>>())
+                .filter(|s| !s.is_empty())
+                .collect();
+            translate::run(paths, validate, pipelines, list, jobs, filters)
         }
         Command::Run {
             exe,

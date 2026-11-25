@@ -43,6 +43,10 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// The title's levels the host texture leaves out
+    /// (`crate::resource::drop_levels`): host level `m` is title level
+    /// `m + drop`.
+    drop: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -54,6 +58,10 @@ pub(crate) struct Staging {
     /// of 1,120 textures in one frame of run 18.)
     dirty: std::sync::atomic::AtomicBool,
     uploaded: std::sync::atomic::AtomicBool,
+    /// Counts how many times this staging buffer was detiled; textures that
+    /// keep changing (`>= 2`, e.g. Bink2 video frames) bypass one-frame-late
+    /// upload skips and staggered 8-frame hashing.
+    changes: std::sync::atomic::AtomicU32,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
@@ -127,6 +135,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
+    // Host copies with other levels than each other's: filled from title
+    // memory instead (`crate::resource::drop_levels`).
+    if crate::resource::dropped(placed) != crate::resource::dropped(source) {
+        return false;
+    }
     let (Some(to), Some(from)) = (
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
@@ -618,7 +631,8 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    let dynamic = staging.changes.load(Relaxed) >= 2;
+    if !dynamic && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -941,7 +955,8 @@ impl Staging {
             let unwritten = last.asked != 0 && written.is_empty();
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            let dynamic = self.changes.load(std::sync::atomic::Ordering::Relaxed) >= 2;
+            if !dynamic && unwritten && !turn {
                 return 0;
             }
         }
@@ -1060,6 +1075,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.changes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1098,7 +1114,7 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.drop, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -1220,9 +1236,60 @@ fn by_query() -> bool {
 /// trimmed), and a one-byte read through the kernel says.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
-fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
-    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+/// Queries the working-set state of up to 256 pages at once; returns
+/// whether the kernel call succeeded.
+fn query_working_set(
+    info: &mut [windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION],
+) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: `info` has valid entries of the size given; our own process.
+    unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), info.as_mut_ptr().cast(), size_of_val(info) as u32) != 0 }
+}
+
+/// Sums the byte spans of `[start, end)` in 64 KiB blocks whose first
+/// page is readable, batching up to 256 block probes per
+/// `K32QueryWorkingSetEx` call and falling back to a 1-byte kernel read
+/// only when a page is not in the working set.
+fn mapped_blocks(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
+    const KERNEL_PAGE: usize = 4096;
+    const BLOCK: usize = 64 << 10;
+    const BATCH: usize = 256;
+    let mut there = 0u64;
+    let mut block = start & !(BLOCK - 1);
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; BATCH] = unsafe { std::mem::zeroed() };
+    let mut spans = [(0usize, 0usize); BATCH];
+    while block < end {
+        let mut n = 0usize;
+        while n < BATCH && block < end {
+            let lo = block.max(start);
+            let hi = block.saturating_add(BLOCK).min(end);
+            // SAFETY: plain data.
+            info[n] = unsafe { std::mem::zeroed() };
+            info[n].VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
+            spans[n] = (lo, hi);
+            n += 1;
+            block = block.saturating_add(BLOCK);
+        }
+        let asked = query_working_set(&mut info[..n]);
+        for i in 0..n {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { info[i].VirtualAttributes.Flags } & 1 != 0;
+            let (lo, hi) = spans[i];
+            let mut byte = [0u8];
+            if valid || crate::host::read_into((lo & !(KERNEL_PAGE - 1)) as *const u8, &mut byte) {
+                there += (hi - lo) as u64;
+            }
+        }
+    }
+    there
+}
+
+fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
+    use windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
     const KERNEL_PAGE: usize = 4096;
     let (first, last) = (at / KERNEL_PAGE, at.saturating_add(len - 1) / KERNEL_PAGE);
     let of = last - first + 1;
@@ -1235,14 +1302,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         for (i, entry) in info[..n].iter_mut().enumerate() {
             entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
         }
-        // SAFETY: `n` entries of the size given; our own process.
-        let asked = unsafe {
-            K32QueryWorkingSetEx(
-                GetCurrentProcess(),
-                info.as_mut_ptr().cast(),
-                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
-            )
-        } != 0;
+        let asked = query_working_set(&mut info[..n]);
         for (i, entry) in info[..n].iter().enumerate() {
             // Bit 0 of the answer: the page is in the working set.
             // SAFETY: plain data the query filled in.
@@ -1307,17 +1367,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return mapped_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
@@ -1403,11 +1453,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        drop: crate::resource::drop_levels(&desc),
         bytes: total,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
+        changes: std::sync::atomic::AtomicU32::new(0),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
@@ -1525,6 +1577,53 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+
+    /// `mapped_bytes` counts committed 64 KiB blocks accurately across
+    /// empty, uncommitted, committed (both untouched and touched into the
+    /// working set), partially committed, unaligned, and multi-batch
+    /// (>256 blocks) ranges.
+    #[test]
+    fn mapped_bytes_counts_committed_and_partial_ranges() {
+        use super::mapped_bytes;
+        use windows_sys::Win32::System::Memory::*;
+        const BLOCK: usize = 64 << 10;
+        const TOTAL_BLOCKS: usize = 270;
+        const COMMIT_BLOCKS: usize = 260;
+        const TOTAL: usize = TOTAL_BLOCKS * BLOCK;
+        const COMMIT: usize = COMMIT_BLOCKS * BLOCK;
+        // SAFETY: a private reservation of our own; only committed pages
+        // are written in place, and nothing else touches this region.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(mapped_bytes(base, 0), 0);
+            assert_eq!(mapped_bytes(base, TOTAL), 0);
+
+            assert_eq!(VirtualAlloc(base.cast(), COMMIT, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            // Untouched committed pages (exercised via fallback read) and
+            // multi-batch (>256 blocks).
+            assert_eq!(mapped_bytes(base, TOTAL), COMMIT as u64);
+            assert_eq!(mapped_bytes(base, COMMIT), COMMIT as u64);
+
+            // Touch selected pages across both batches so `Flags & 1 != 0`
+            // is also exercised alongside untouched blocks.
+            base.write(0x11);
+            base.add(BLOCK).write(0x22);
+            base.add(257 * BLOCK).write(0x33);
+            assert_eq!(mapped_bytes(base, TOTAL), COMMIT as u64);
+
+            // Decommit a 64 KiB block in each batch and check unaligned bounds.
+            assert_ne!(VirtualFree(base.add(4 * BLOCK).cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert_ne!(VirtualFree(base.add(258 * BLOCK).cast(), BLOCK, MEM_DECOMMIT), 0);
+            let expected = (COMMIT_BLOCKS - 2) * BLOCK;
+            assert_eq!(mapped_bytes(base, TOTAL), expected as u64);
+            assert_eq!(mapped_bytes(base.add(500), TOTAL - 1000), (expected - 500) as u64);
+            assert_eq!(mapped_bytes(base.add(500), 6 * BLOCK - 1000), (5 * BLOCK - 1000) as u64);
+            assert_eq!(mapped_bytes(base.add(COMMIT), TOTAL - COMMIT), 0);
+
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
 }

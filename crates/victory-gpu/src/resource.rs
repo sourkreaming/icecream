@@ -281,7 +281,11 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
+                    tracing::info!(
+                        format = f,
+                        stand_in = to,
+                        "the host does not render to this format: a stand-in is used"
+                    );
                 }
                 refused
             })
@@ -1270,6 +1274,78 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// How many of its largest levels the host copy of a texture described by
+/// `desc` leaves out (`VICTORY_TEXTURE_DROP_MIPS=N`, at most 4; 0, the
+/// default, leaves out none). Each level left out divides the
+/// texture's bytes by about four: on an 8 GB card the textures picked by index
+/// stop at the memory budget with about 15,000 more due, and the GPU time
+/// per frame triples (RTX 4060 Ti, first room). Only 2D textures the
+/// title fills ([`fills`]), arrays and cubes included, at least 512 texels
+/// on their shorter side, whose sides the levels left out halve exactly
+/// into whole 4-texel blocks: host level `m` is then title level `m + N`
+/// texel for texel. Shaders see the texture at half the size per level
+/// left out: views shift their levels ([`shift_levels`]), and copies
+/// between such a texture and another are skipped (`list.rs` `unlike`).
+#[cfg(windows)]
+pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_DROP_MIPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(4)
+    });
+    if n == 0 || !fills(desc) || desc.dimension != TEXTURE_2D || desc.sample_count > 1 {
+        return 0;
+    }
+    let n = n.min(u32::from(desc.mip_levels).saturating_sub(1));
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let whole = |side: u64| side % (4 << n) == 0;
+    if n == 0 || w.min(h) < 512 || !whole(w) || !whole(h) {
+        return 0;
+    }
+    n
+}
+
+/// [`drop_levels`] of title resource `this`; 0 for buffers and null.
+#[cfg(windows)]
+pub(crate) fn dropped(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    drop_levels(&resource(this).desc)
+}
+
+/// The host copy's subresource for subresource `index` of title texture
+/// `this`, whose host copy leaves out [`dropped`] levels: `None` for a
+/// level it leaves out.
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let drop = dropped(this);
+    let mips = u32::from(resource(this).desc.mip_levels).max(1);
+    let (mip, slice) = (index % mips, index / mips);
+    (mip >= drop).then(|| mip - drop + slice * (mips - drop))
+}
+
+/// A shader view's first level, level count and smallest-level clamp
+/// (`first`, `levels`, `clamp`) on a host texture that leaves out `drop`
+/// title levels: the same texels where they are there, else the host's
+/// largest level. A level count of `u32::MAX` (all of them) stays.
+pub(crate) fn shift_levels(drop: u32, first: &mut u32, levels: &mut u32, clamp: &mut f32) {
+    if drop == 0 {
+        return;
+    }
+    if *levels != u32::MAX {
+        // Levels the view names that the host texture has: at least one.
+        let end = first.saturating_add(*levels);
+        *levels = end.saturating_sub(drop.max(*first)).max(1);
+    }
+    *first = first.saturating_sub(drop);
+    *clamp = (*clamp - drop as f32).max(0.0);
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1405,18 +1481,40 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Pure VRAM and shared-memory room decision extracted for unit testing.
+#[cfg(any(windows, test))]
+fn room_for(filled: u64, video: Option<[u64; 4]>, percent: u64, reserve: u64) -> bool {
+    const FLOOR: u64 = 2 << 30;
+    const SMALL_FLOOR: u64 = 1 << 30;
+    const WITHOUT_BUDGET: u64 = 4 << 30;
+    match video {
+        Some([budget, used, shared_budget, shared_used]) => {
+            if budget > 0 && used >= budget / 100 * 88 {
+                return false;
+            }
+            if shared_budget > 0 && shared_used >= shared_budget / 100 * 96 {
+                return false;
+            }
+            let floor = if budget <= (8u64 << 30) { SMALL_FLOOR } else { FLOOR };
+            if filled < floor {
+                return true;
+            }
+            used.saturating_add(reserve) < budget / 100 * percent
+        }
+        None => filled < WITHOUT_BUDGET,
+    }
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
-/// limit on those copies' bytes instead). Past the budget the system moves
-/// the card's memory into the PC's, which ended runs 20 and 24.
+/// up to `FLOOR` (1 GiB on <= 8 GiB cards, 2 GiB otherwise) unless DXGI VRAM
+/// already exceeds 88% or shared PC memory exceeds 96%, beyond that while the
+/// card's memory in use by this process (plus reserved card buffer/target room)
+/// is under [`room_percent`] of its DXGI budget (`VICTORY_TEXTURE_BUDGET_MB`
+/// sets a byte limit instead).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const FLOOR: u64 = 2 << 30;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -1428,25 +1526,18 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
-        return true;
-    }
-    match crate::host::host().and_then(|h| h.video_memory()) {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
+    room_for(
+        filled,
+        crate::host::host().and_then(|h| h.video_memory()),
+        room_percent(),
+        crate::shadow::card_room_kept() + targets_room_kept(),
+    )
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (1,536 on <= 8 GiB cards,
+/// 3,072 otherwise; 0: none, as before) less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1468,7 +1559,15 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                || {
+                    let small_vram = crate::host::host()
+                        .and_then(|h| h.video_memory())
+                        .is_some_and(|[budget, ..]| budget <= (8u64 << 30));
+                    if small_vram { 1024 << 20 } else { 3072 << 20 }
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -1494,20 +1593,31 @@ pub(crate) fn room_lately() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): 90 by default on GPUs with
+/// more than 8 GiB DXGI budget, or 82 (with `VICTORY_LEVELS_ON_DEMAND=1`) /
+/// 68 (otherwise) on <= 8 GiB GPUs so bindless textures leave headroom for
+/// render targets and card-backed buffers, unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (35 to 97).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+        let chosen = std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map(|percent| percent.clamp(35, 97))
+            .unwrap_or_else(|| {
+                let small_vram = crate::host::host()
+                    .and_then(|h| h.video_memory())
+                    .is_some_and(|[budget, ..]| budget <= (8u64 << 30));
+                if small_vram {
+                    if crate::tiles::wanted() { 82 } else { 68 }
+                } else {
+                    90
+                }
+            });
+        tracing::info!(percent = chosen, "bindless texture VRAM ceiling");
+        chosen
     })
 }
 
@@ -2072,6 +2182,12 @@ fn host_texture_as(
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
+    let drop = drop_levels(desc);
+    if drop > 0 {
+        d.width >>= drop;
+        d.height >>= drop;
+        d.mip_levels -= drop as u16;
+    }
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour
@@ -2828,6 +2944,69 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Views of a host copy without its largest level keep their texels:
+    /// a view of title level 0 alone shows host level 0 (title level 1),
+    /// one of levels 3 and 4 shows host levels 2 and 3, all levels stay all.
+    #[test]
+    fn views_shift_down_by_the_levels_left_out() {
+        let shifted = |drop, first, levels, clamp| {
+            let (mut f, mut l, mut c) = (first, levels, clamp);
+            shift_levels(drop, &mut f, &mut l, &mut c);
+            (f, l, c)
+        };
+        assert_eq!(shifted(1, 0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        assert_eq!(shifted(1, 0, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(1, 0, 10, 0.0), (0, 9, 0.0));
+        assert_eq!(shifted(1, 3, 2, 2.5), (2, 2, 1.5));
+        assert_eq!(shifted(2, 1, 1, 0.0), (0, 1, 0.0));
+        assert_eq!(shifted(0, 3, 2, 1.0), (3, 2, 1.0));
+    }
+
+    #[test]
+    fn room_respects_vram_and_shared_ceilings_even_below_floor() {
+        let gib = 1024 * 1024 * 1024;
+        let small_budget = 7 * gib;
+        let shared_budget = 7 * gib;
+        // Below 1 GiB small-VRAM floor, but DXGI VRAM >= 88% -> false.
+        assert!(!room_for(
+            512 << 20,
+            Some([small_budget, small_budget / 100 * 88, shared_budget, gib]),
+            45,
+            0,
+        ));
+        // Below 1 GiB small-VRAM floor, but shared RAM >= 96% -> false.
+        assert!(!room_for(
+            512 << 20,
+            Some([small_budget, 2 * gib, shared_budget, shared_budget / 100 * 96]),
+            45,
+            0,
+        ));
+        // Below 1 GiB small-VRAM floor with safe VRAM & shared RAM -> true.
+        assert!(room_for(
+            512 << 20,
+            Some([small_budget, 3 * gib, shared_budget, 2 * gib]),
+            45,
+            0,
+        ));
+        // Above 1 GiB small-VRAM floor with VRAM between 45% and 88% -> false.
+        assert!(!room_for(
+            1500 << 20,
+            Some([small_budget, small_budget / 100 * 50, shared_budget, 2 * gib]),
+            45,
+            0,
+        ));
+        // Above floor when `used + reserve` reaches `percent` -> false.
+        assert!(!room_for(
+            1500 << 20,
+            Some([small_budget, 2 * gib, shared_budget, 2 * gib]),
+            68,
+            3 * gib,
+        ));
+        // Video memory unavailable fallback: filled < 4 GiB.
+        assert!(room_for(3 * gib, None, 45, 0));
+        assert!(!room_for(4 * gib, None, 45, 0));
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

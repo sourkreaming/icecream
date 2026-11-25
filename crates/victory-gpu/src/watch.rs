@@ -497,6 +497,36 @@ pub(crate) fn wrote(at: usize, len: usize) {
     j.last_write = j.last_write.max(now);
 }
 
+/// Whether `[start, start + len)` lies in a `MEM_WRITE_WATCH` allocation
+/// (title GPU memory reserved via `XMemVirtualAlloc`), without clearing dirty bits.
+#[cfg(windows)]
+pub(crate) fn is_write_watched(start: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    if len == 0 {
+        return false;
+    }
+    let mut buf = [std::ptr::null_mut(); 16];
+    let mut count = buf.len();
+    let mut gran = 0u32;
+    // SAFETY: read-only query (`flags = 0`) into a 16-entry pointer buffer; the
+    // kernel validates `[start, start + len)`.
+    unsafe {
+        GetWriteWatch(
+            0,
+            start as *const _,
+            len,
+            buf.as_mut_ptr(),
+            &mut count,
+            &mut gran,
+        ) == 0
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_write_watched(_start: usize, _len: usize) -> bool {
+    false
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -787,7 +817,6 @@ fn ask_view() -> bool {
             .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
     })
 }
-
 struct Guards {
     /// Blocks we made read-only.
     protected: RangeSet,
@@ -1900,6 +1929,29 @@ mod tests {
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
+    #[test]
+    fn is_write_watched_distinguishes_watch_allocs_from_heap() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let heap_buf = vec![0u8; PAGE];
+        assert!(!super::is_write_watched(heap_buf.as_ptr() as usize, PAGE));
+        // SAFETY: standalone write-watched reservation/commit freed below.
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!watched.is_null());
+        assert!(super::is_write_watched(watched as usize, PAGE));
+        // SAFETY: matches `VirtualAlloc` above.
+        unsafe { VirtualFree(watched, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;

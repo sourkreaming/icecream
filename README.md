@@ -69,20 +69,6 @@ What did it, on top of the list below:
   shader programs translate; a program is translated with first-half
   interpolation pairs only if it was refused for one (with that on for
   every program, 8,551 working pixel programs came out changed).
-- Frame rate, first cuts on the processor side: the descriptor sync uses a
-  cheap fingerprint and leaves draw-table slots to their draws (the pass
-  over the heap went from 70-220 ms a frame to about 3), and memory the
-  guards already hold is not asked of the write watch (pull request #670
-  by Jonirulah). Card copies' pieces can come down inside their own
-  flights (pull request #648 by Jonirulah, `VICTORY_CARD_FETCH_INFLIGHT=1`,
-  off by default: the copy-back thread's wait went from 181 ms a frame to
-  0 here, but the card got busier, so no gain is claimed yet). The frame is
-  still 250 to 380 ms: the card is the limit now, most of it the
-  per-record clamp before each of some 6,700 indirect draws a frame.
-- Tried and NOT in this tree: pull request #220 (cheaper indirect draws)
-  with `VICTORY_INDIRECT_WINDOW=1` cut the card's time from about 100-150
-  to 35-80 ms a frame here, and lost the device twice (once with a page
-  fault on the card after 160 s). Do not turn windows on with it yet.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
@@ -146,6 +132,7 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- On 8 GB cards, `VICTORY_TEXTURE_DROP_MIPS=1` leaves out the largest level of the 2D textures the title fills (they keep about a quarter of their bytes), so the textures picked by index fit in the card's memory budget: on an RTX 4060 Ti 8 GB, about 210 ms a frame in the first room instead of about 430, with 6,000 textures waiting instead of 15,000. Off by default.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 

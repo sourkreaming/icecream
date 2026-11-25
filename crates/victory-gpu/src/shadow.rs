@@ -2261,6 +2261,15 @@ impl Shadow {
         shadow
     }
 
+    fn is_read_only_placed(&self) -> bool {
+        if self.place.is_none() {
+            return false;
+        }
+        // SAFETY: a live buffer.
+        let flags = unsafe { self.buffer.GetDesc() }.Flags;
+        flags.0 & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -3148,6 +3157,18 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.card.is_none()
+            && let Some(before) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+            && !before.is_empty()
+        {
+            let (off, n) = (from - start, to - from);
+            if off + n <= before.len() {
+                // SAFETY: `at` holds `n` freshly copied bytes and `before` has length >= `off + n`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(at, before.as_mut_ptr().add(off), n);
+                }
+            }
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -3445,8 +3466,8 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 }
 
 /// The title buffer holding `address`, as (start, length), without making
-/// its copy (diagnostics: which buffer a dropped program's root view names).
-#[cfg(feature = "diagnostics")]
+/// its copy (diagnostics: which buffer a dropped program's root view names;
+/// also used by `memory.rs`).
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
     buffers()
         .range(..=(address, usize::MAX))
@@ -3502,7 +3523,48 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, false, false)
+}
+
+/// As [`find`], guaranteeing the returned copy has `ALLOW_UNORDERED_ACCESS`.
+/// If an existing loose window is a read-only in-place buffer, evicts it
+/// (retiring via [`crate::host::retire`]), records its cell in
+/// [`WRITABLE_WINDOWS`], and replaces it with a standard writable host copy.
+pub(crate) fn find_writable(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    lookup(address, len, false, true)
+}
+
+/// Returns an existing writable host copy (registered buffer or loose window)
+/// covering `[address, address + len.max(1))`, without allocating a new host
+/// buffer.
+pub(crate) fn find_existing_writable(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    let key = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k);
+    if let Some(key) = key {
+        let entry = map.get(&key)?;
+        return entry
+            .shadow
+            .as_ref()
+            .filter(|s| !s.is_read_only_placed())
+            .cloned();
+    }
+    drop(map);
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let (cell, _) = window_of(address, end, WINDOW);
+    let there = map
+        .range((cell, 0)..=(address, u64::MAX))
+        .filter(|(_, s)| !s.is_read_only_placed())
+        .map(|(k, _)| *k);
+    let key = holder(there, address, end)?;
+    let shadow = map.get(&key)?.clone();
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    Some(shadow)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -3527,10 +3589,10 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, false)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+fn lookup(address: u64, len: u64, any: bool, writable: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -3541,7 +3603,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, writable);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -3741,44 +3803,28 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Loose window cells promoted to writable host copies (UAV / raw memory demand),
+/// so they are never placed as read-only in-place windows again.
+static WRITABLE_WINDOWS: Mutex<std::collections::BTreeSet<(u64, u64)>> =
+    Mutex::new(std::collections::BTreeSet::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
-    // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
+fn is_writable_window(start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    let w = WRITABLE_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    w.contains(&(start, len))
+        || w.iter().any(|&(ws, wl)| ws < end && ws.saturating_add(wl) > start)
+}
+
+fn overlaps_buffer(start: u64, len: u64) -> bool {
+    let end = start.saturating_add(len);
+    buffers()
+        .range(..(end, 0))
+        .rev()
+        .take(256)
+        .any(|(_, e)| e.end > start)
+}
+
+fn make_loose_copy(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -3811,6 +3857,64 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
+    Some(shadow)
+}
+
+fn loose(
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+    writable: bool,
+) -> Option<Arc<Shadow>> {
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let grid = if unsized_ask { WINDOW } else { window() };
+    let (cell, _) = window_of(address, end, WINDOW);
+    let named = window_of(address, end, grid);
+    let (start, len) = if unsized_ask && tails() {
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+    } else if any && fine() && !unsized_ask {
+        // The windows that begin in the ask's cell at or below the ask (one
+        // that begins in a cell below and reaches this far is passed over:
+        // the ask then makes its own).
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        holder(there, address, end).unwrap_or(named)
+    } else {
+        named
+    };
+    // Under the lock, with the handing out: see `let_go_idle`.
+    let note = |shadow: &Shadow| {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    if let Some(shadow) = map.get(&(start, len)).cloned() {
+        if !writable || !shadow.is_read_only_placed() {
+            note(&shadow);
+            return Some(shadow);
+        }
+        if let Some(evicted) = map.remove(&(start, len)) {
+            crate::host::retire(evicted);
+        }
+    }
+    if writable {
+        WRITABLE_WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).insert((start, len));
+    } else if !overlaps_buffer(start, len)
+        && !is_writable_window(start, len)
+        && let Some(placed) = crate::inplace::place_for(start, len, true)
+    {
+        // In place, if asked for and the window's memory can be opened: the
+        // window is the title's own memory, with nothing to copy.
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    let shadow = make_loose_copy(start, len)?;
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
@@ -3995,6 +4099,25 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn writable_windows_and_buffer_overlaps_block_in_place() {
+        let base = 0x30_0000_0000u64;
+        super::register(0xbeef, base + 0x10_0000, 0x2_0000);
+        assert_eq!(super::extent(base + 0x10_1000), Some((base + 0x10_0000, 0x2_0000)));
+        assert!(super::overlaps_buffer(base, WINDOW));
+        assert!(!super::overlaps_buffer(base + WINDOW, WINDOW));
+        super::unregister(0xbeef, base + 0x10_0000);
+        assert_eq!(super::extent(base + 0x10_1000), None);
+        assert!(!super::overlaps_buffer(base, WINDOW));
+
+        let cell = (base + 2 * WINDOW, WINDOW);
+        assert!(!super::is_writable_window(cell.0, cell.1));
+        super::WRITABLE_WINDOWS.lock().unwrap().insert(cell);
+        assert!(super::is_writable_window(cell.0, cell.1));
+        assert!(super::is_writable_window(cell.0 + 0x10_0000, 0x10_0000));
+        super::WRITABLE_WINDOWS.lock().unwrap().remove(&cell);
     }
 }
 

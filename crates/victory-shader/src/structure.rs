@@ -507,6 +507,9 @@ struct Lanes<'a> {
     /// Phi ids whose joins depend on EXEC or VALU results (including along
     /// back edges), carried across resets so their joins stay in `masks`.
     derived_phis: HashSet<Value>,
+    /// Non-EXEC phi ids that mix a mask with an opaque scalar value (e.g., a
+    /// register reused for both a mask and a loaded number).
+    opaque_phis: HashSet<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -603,6 +606,7 @@ impl<'a> Lanes<'a> {
             phis,
             unresolved: HashSet::new(),
             derived_phis: HashSet::new(),
+            opaque_phis: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -634,6 +638,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.opaque_phis.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -960,6 +965,7 @@ impl<'a> Lanes<'a> {
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
         let mut derived = self.derived_phis.contains(&id);
+        let mut has_opaque = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
         for (n, &a) in args.iter().enumerate() {
@@ -967,11 +973,17 @@ impl<'a> Lanes<'a> {
             if self.index[q] < self.index[block] {
                 let (m, d) = self.mask(a);
                 derived |= d;
+                has_opaque |= self.opaque_phis.contains(&a.0)
+                    || self.opaque_phis.contains(&a.1)
+                    || (!d && self.b.support(m).iter().any(|x| matches!(x, Atom::Opaque(_))));
                 let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
             } else {
                 self.seen.push(a);
             }
+        }
+        if derived && has_opaque && !self.active.contains(&id) {
+            self.opaque_phis.insert(id);
         }
         if forward.len() == args.len()
             && let Some(&(_, m)) = forward.first()
@@ -1191,7 +1203,10 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        let is_mask = self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        if is_mask && !self.opaque_phis.contains(&k.0) && !self.opaque_phis.contains(&k.1) {
+                            takes_mask = true;
+                        }
                     }
                 }
                 let touches_exec =
@@ -1844,5 +1859,38 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn mixed_mask_and_opaque_phi_does_not_taint_scalar_bit_ops() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0x8702_7E6A, // s_and_b32 s2, vcc_lo, exec_lo
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF85_0003, // s_cbranch_scc1 merge
+                0xF400_0082,
+                0xFA00_0000, // s_load_dword s2, s[4:5], null
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                // merge:
+                0x8703_FF02,
+                0x001F_FFFF, // s_and_b32 s3, s2, 0x001fffff
+                0x8806_0301, // s_or_b32 s6, s1, s3
+                0x7D8A_0006, // v_cmp_ne_u32 vcc_lo, s6, v0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let def = |reg: u8| {
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| i.write(Reg::S(reg)))
+                .last()
+                .expect("write")
+        };
+        assert!(!s.masks.contains_key(&def(3)), "s3 should stay scalar data");
+        assert!(!s.masks.contains_key(&def(6)), "s6 should stay scalar data");
     }
 }
