@@ -645,6 +645,54 @@ impl Drop for Tiled {
     }
 }
 
+/// Host textures with levels on demand let go while something else may
+/// still name them, with their tiles: a list recorded or in the air keeps
+/// the texture (`HostList::keep`), not its host copy, and the texture's
+/// tiles are in heaps of ours. Given back to the pool, they were given to
+/// other textures, and a heap with all its tiles free went back to the
+/// card, while a list still to run read through the old texture's
+/// mappings: the device was removed seconds after a sweep that let go 610
+/// host copies, with a heap given back. Here the tiles stay given until
+/// the texture is ours alone.
+static LET_GO: Mutex<Vec<(ID3D12Resource, Tiled)>> = Mutex::new(Vec::new());
+
+/// `texture`'s host copy is let go: its tiles go back once nothing else
+/// names `texture` ([`give_back_let_go`]); at once if nothing does now.
+pub(crate) fn let_go(texture: ID3D12Resource, tiled: Tiled) {
+    if crate::host::references(&texture) == 1 {
+        drop(texture);
+        drop(tiled);
+        return;
+    }
+    LET_GO.lock().unwrap_or_else(|e| e.into_inner()).push((texture, tiled));
+}
+
+/// The host copies let go whose tiles still wait (tests).
+#[cfg(test)]
+fn let_go_waiting() -> usize {
+    LET_GO.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Gives back the tiles of textures let go that nothing else names now
+/// (the sweep calls it; lists drop what they keep when they are reset).
+pub(crate) fn give_back_let_go() {
+    let done: Vec<(ID3D12Resource, Tiled)> = {
+        let mut waiting = LET_GO.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.is_empty() {
+            return;
+        }
+        let (done, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *waiting).into_iter().partition(|(texture, _)| crate::host::references(texture) == 1);
+        *waiting = keep;
+        done
+    };
+    // The texture first, then its tiles (`Tiled`'s drop gives them back).
+    for (texture, tiled) in done {
+        drop(texture);
+        drop(tiled);
+    }
+}
+
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the
@@ -1435,6 +1483,36 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    /// A host copy let go while a list still keeps its texture (as
+    /// `HostList::keep` does): the tiles stay given until nothing but the
+    /// let-go list names the texture (issue #776).
+    fn a_texture_kept_by_a_list_keeps_its_tiles(rig: &mut Rig) {
+        rig.step = "step 8, a texture let go while a list keeps it";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        rig.give(&tiled, &texture, tiled.with_level(0));
+        // (the mapping is on the queue: run it before the texture can go)
+        rig.run(|_| {});
+        assert!(tiled.given_bytes() > 0, "level 0 has tiles");
+        let waiting = super::let_go_waiting();
+        // A list recorded or in the air keeps the texture.
+        let kept_by_a_list = texture.clone();
+        super::let_go(texture, tiled);
+        assert_eq!(super::let_go_waiting(), waiting + 1, "the tiles wait while the list keeps the texture");
+        super::give_back_let_go();
+        assert_eq!(super::let_go_waiting(), waiting + 1, "still kept: still waiting");
+        // The list is reset: it lets go of the texture.
+        drop(kept_by_a_list);
+        super::give_back_let_go();
+        assert_eq!(super::let_go_waiting(), waiting, "nothing names the texture: its tiles go back");
+        // And a texture nothing else names gives them back at once.
+        let (texture, tiled) = rig.reserved(&desc);
+        rig.give(&tiled, &texture, tiled.with_level(0));
+        rig.run(|_| {});
+        super::let_go(texture, tiled);
+        assert_eq!(super::let_go_waiting(), waiting, "given back at once");
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1451,6 +1529,7 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        a_texture_kept_by_a_list_keeps_its_tiles(&mut rig);
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
