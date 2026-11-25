@@ -129,13 +129,19 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// The containers (by the 16-digit hash the log names shaders with) whose
 /// wave64 compute program may take the wave-wide form on a host of 32-lane
 /// waves (`victory_shader::emit::with_wave_wide`): `VICTORY_WAVE_WIDE_ONLY`,
-/// a list of hashes, or by default the four programs of this title that
+/// a list of hashes, or by default the five programs of this title that
 /// come out of it with 32-lane waves and otherwise do not run at all on
 /// such a host (the driver refuses their 64-lane form: water transmission
-/// volumetrics, both kinds; particle visibility; the tiling of the
+/// volumetrics, all three variants; particle visibility; the tiling of the
 /// screen-space reflection pass). `VICTORY_WAVE_WIDE_ONLY=none` allows none.
 static WAVE_WIDE: OnceLock<Vec<String>> = OnceLock::new();
-const WAVE_WIDE_DEFAULT: [&str; 4] = ["5dc3b25986622949", "6f225b641c5b0708", "369cbe906ea72764", "2cc4c197ee29e291"];
+const WAVE_WIDE_DEFAULT: [&str; 5] = [
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+    "a10179ab7eda0dc3",
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+];
 
 /// The containers whose first-lane reads where not every lane runs take the
 /// host wave's own first lane (`victory_shader::emit::with_firstlane_own`):

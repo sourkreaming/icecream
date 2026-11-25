@@ -1738,7 +1738,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    with_state_how(this, true, |list, state| state.set_pipeline_on(list, pipeline));
     #[cfg(not(windows))]
     let _ = this;
 }
@@ -1788,7 +1788,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, with_state, with_state_how};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1803,7 +1803,7 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
-        with_state(this, |list, s| s.set_topology(list, topology));
+        with_state_how(this, true, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
         this: This,
@@ -1812,34 +1812,34 @@ mod state {
     ) {
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
-        with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
+        with_state_how(this, true, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
+        with_state_how(this, true, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        with_state(this, |list, s| {
+        with_state_how(this, true, |list, s| {
             // SAFETY: the title passes four floats or null.
             s.set_blend_factor(list, unsafe { factor.as_ref() })
         });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        with_state(this, |list, s| s.set_stencil_ref(list, reference));
+        with_state_how(this, true, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-        with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+        with_state_how(this, true, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
-        with_state(this, |_, s| s.set_heaps(items(heaps, count)));
+        with_state_how(this, true, |list, s| s.set_heaps(list, items(heaps, count)));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(true, slot, handle));
+        with_state_how(this, true, |list, s| s.set_table(list, true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
-        with_state(this, |_, s| s.set_table(false, slot, handle));
+        with_state_how(this, true, |list, s| s.set_table(list, false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
-        with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
+        with_state_how(this, true, |list, s| s.set_constants(list, true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
         this: This,
@@ -1847,7 +1847,7 @@ mod state {
         value: u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
+        with_state_how(this, true, |list, s| s.set_constants(list, false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
         this: This,
@@ -1856,8 +1856,8 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(true, slot, items(values, count), offset)
+        with_state_how(this, true, |list, s| {
+            s.set_constants(list, true, slot, items(values, count), offset)
         });
     }
     pub(super) extern "system" fn graphics_constants(
@@ -1867,20 +1867,20 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(false, slot, items(values, count), offset)
+        with_state_how(this, true, |list, s| {
+            s.set_constants(list, false, slot, items(values, count), offset)
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(true, slot, address));
+        with_state_how(this, true, |list, s| s.set_view(list, true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
-        with_state(this, |_, s| s.set_view(false, slot, address));
+        with_state_how(this, true, |list, s| s.set_view(list, false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
         // SAFETY: the title passes a view or null.
-        with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
+        with_state_how(this, true, |list, s| s.set_index_buffer(list, unsafe { view.as_ref() }));
     }
     pub(super) extern "system" fn vertex_buffers(
         this: This,
@@ -1888,11 +1888,11 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
-        with_state(this, |_, s| {
+        with_state_how(this, true, |list, s| {
             if views.is_null() {
-                s.clear_vertex_buffers(start, count);
+                s.clear_vertex_buffers(list, start, count);
             } else {
-                s.set_vertex_buffers(start, items(views, count));
+                s.set_vertex_buffers(list, start, items(views, count));
             }
         });
     }

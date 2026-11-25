@@ -570,37 +570,33 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// the order to serve them. Alternate retries with fresh slots so a
+    /// backlog of unmapped or partial textures cannot starve new character
+    /// and world textures; among fresh slots, alternate newest and oldest.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let mut again: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        // Sort ascending by write number so `pop` / `next_back` yield newest first.
+        again.sort_unstable_by_key(|&(_, write)| write);
+        fresh.sort_unstable_by_key(|&(_, write)| write);
+        let count = max.min(again.len() + fresh.len());
+        let mut fresh = fresh.into_iter();
+        let mut retry = frame & 1 == 0;
+        let mut newest = again.is_empty() || frame & 2 == 0;
+        let mut order = Vec::with_capacity(count);
+        while order.len() < count {
+            if !again.is_empty() && (retry || fresh.len() == 0) {
+                order.push(again.pop().unwrap());
+            } else if let Some(next) = if newest { fresh.next_back() } else { fresh.next() } {
+                order.push(next);
+                newest = !newest;
             }
+            retry = !retry;
         }
-        order.truncate(max);
         order
     }
 

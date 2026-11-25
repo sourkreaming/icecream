@@ -823,6 +823,12 @@ pub(crate) struct HostList {
     /// Whether a shader on this list has bound a writable UAV since the last
     /// global UAV barrier.
     uav_dirty: std::sync::atomic::AtomicBool,
+    /// Raw COM pointers of buffers that already received a scoped UAV barrier
+    /// since the last UAV write or reset, avoiding duplicate UAV stalls across
+    /// consecutive indirect clamps.
+    uav_synced: Mutex<std::collections::HashSet<usize>>,
+    /// Fast-path flag so `mark_uav_dirty`/`reset` avoid locking `uav_synced` when empty.
+    uav_synced_any: std::sync::atomic::AtomicBool,
     /// Whether `indirect`'s argument clamp has dispatched on this list since
     /// reset (and may have in-flight writes to `budget`).
     clamp_ran: std::sync::atomic::AtomicBool,
@@ -3334,6 +3340,8 @@ impl Host {
                 // Start dirty so the first barrier/clamp on a fresh list still synchronizes any
                 // UAV writes made by preceding command lists before clearing `uav_dirty`.
                 uav_dirty: std::sync::atomic::AtomicBool::new(true),
+                uav_synced: Mutex::default(),
+                uav_synced_any: std::sync::atomic::AtomicBool::new(false),
                 clamp_ran: std::sync::atomic::AtomicBool::new(false),
                 memory_dirty: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
@@ -3719,16 +3727,27 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                pResource: std::mem::ManuallyDrop::new(None),
-                            }),
-                        },
-                    }]);
+                    // What the submission's shaders wrote to the compared buffers, first
+                    // (scoped barriers instead of `pResource = None` full-GPU drains).
+                    let mut uavs: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+                    let mut keep_before: Vec<ID3D12Resource> = Vec::new();
+                    let mut seen_res: Vec<usize> = Vec::new();
+                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                        let buf_raw = r.shadow.buffer.as_raw() as usize;
+                        if !seen_res.contains(&buf_raw) {
+                            seen_res.push(buf_raw);
+                            uavs.push(uav_barrier(Some(&r.shadow.buffer)));
+                            if let Some((_, Some(before), _)) = r.shadow.card_sides() {
+                                uavs.push(uav_barrier(Some(&before)));
+                                keep_before.push(before);
+                            }
+                        }
+                    }
+                    if !uavs.is_empty() {
+                        uavs.push(uav_barrier(Some(&work.differs.0)));
+                        list.ResourceBarrier(&uavs);
+                    }
+                    drop(keep_before);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -3747,15 +3766,11 @@ impl Host {
                     // every compare of the list, the pieces they flagged go
                     // to slots in the PC's memory.
                     if flown && let Some(inflight) = &work.inflight {
-                        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                                    pResource: std::mem::ManuallyDrop::new(None),
-                                }),
-                            },
-                        }]);
+                        list.ResourceBarrier(&[
+                            uav_barrier(Some(&work.differs.0)),
+                            uav_barrier(Some(&inflight.table.0)),
+                            uav_barrier(Some(&inflight.fetched.0)),
+                        ]);
                         list.SetComputeRootSignature(&inflight.root);
                         list.SetPipelineState(&inflight.pso);
                         list.SetComputeRootUnorderedAccessView(2, work.differs.0.GetGPUVirtualAddress());
@@ -5344,7 +5359,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         // Start dirty on reuse so the first barrier/clamp on this list synchronizes prior-list UAVs.
-        self.uav_dirty.store(true, Ordering::Relaxed);
+        self.set_uav_dirty(true);
         self.clamp_ran.store(false, Ordering::Relaxed);
         self.memory_dirty.store(false, Ordering::Relaxed);
         if let Some((_, _, used)) =
@@ -5862,6 +5877,29 @@ impl HostList {
         }
     }
 
+    /// Brings many ranges up to date under a single `deferred` lock.
+    pub(crate) fn defer_refreshes(
+        &self,
+        entries: Vec<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        for (shadow, address, len) in entries {
+            let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+            if deferred.shadow_ptrs.insert(ptr) {
+                deferred.shadows.push(shadow.clone());
+            }
+            let key = (ptr, address, len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), address, len));
+            }
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -5879,9 +5917,16 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    fn set_uav_dirty(&self, dirty: bool) {
+        self.uav_dirty.store(dirty, Ordering::Relaxed);
+        if self.uav_synced_any.swap(false, Ordering::Relaxed) {
+            self.uav_synced.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+
     /// Marks that a shader on this list bound a writable UAV.
     pub(crate) fn mark_uav_dirty(&self) {
-        self.uav_dirty.store(true, Ordering::Relaxed);
+        self.set_uav_dirty(true);
     }
 
     /// Whether a shader on this list bound a writable UAV since the last
@@ -5892,7 +5937,26 @@ impl HostList {
 
     /// Clears the list's `uav_dirty` flag after a global UAV barrier.
     pub(crate) fn clear_uav_dirty(&self) {
-        self.uav_dirty.store(false, Ordering::Relaxed);
+        self.set_uav_dirty(false);
+    }
+
+    /// Returns `true` if `resource` still needs a scoped UAV barrier before
+    /// being read by a clamp pass, marking it synced until the next UAV write
+    /// or list reset (`VICTORY_CLAMP_DEDUP=0` forces a barrier every time).
+    pub(crate) fn take_uav_barrier_for(&self, resource: &ID3D12Resource) -> bool {
+        static DEDUP: OnceLock<bool> = OnceLock::new();
+        if !*DEDUP.get_or_init(|| std::env::var_os("VICTORY_CLAMP_DEDUP").is_none_or(|v| v != "0")) {
+            return true;
+        }
+        if !self.uav_dirty() {
+            return false;
+        }
+        let mut synced = self.uav_synced.lock().unwrap_or_else(|e| e.into_inner());
+        let needed = synced.insert(resource.as_raw() as usize);
+        if needed {
+            self.uav_synced_any.store(true, Ordering::Relaxed);
+        }
+        needed
     }
 
     pub(crate) fn mark_memory_dirty(&self) {

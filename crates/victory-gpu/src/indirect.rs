@@ -423,27 +423,42 @@ fn record_clamp_as(
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;
-    let mut first = [
+    let mut first_buf = [
         crate::host::uav_barrier(None),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        crate::host::uav_barrier(None),
+        crate::host::uav_barrier(None),
+        crate::host::uav_barrier(None),
     ];
-    let first_start = if !waits {
-        1
-    } else if list.is_none_or(|h| h.uav_dirty()) {
+    let mut first_len = 0usize;
+    if waits {
         if let Some(h) = list {
-            h.clear_uav_dirty();
+            if h.take_uav_barrier_for(src) {
+                first_buf[first_len] = crate::host::uav_barrier(Some(src));
+                first_len += 1;
+            }
+            if let Some((buf, _)) = count.filter(|(buf, _)| *buf != src)
+                && h.take_uav_barrier_for(buf)
+            {
+                first_buf[first_len] = crate::host::uav_barrier(Some(buf));
+                first_len += 1;
+            }
+            if h.clamp_ran()
+                && let Some(b_res) = budget_res
+            {
+                first_buf[first_len] = crate::host::uav_barrier(Some(b_res));
+                first_len += 1;
+            }
+        } else {
+            first_buf[first_len] = crate::host::uav_barrier(None);
+            first_len += 1;
         }
-        0
-    } else if list.is_some_and(|h| h.clamp_ran()) && budget_res.is_some() {
-        first[0] = crate::host::uav_barrier(budget_res);
-        0
-    } else {
-        1
-    };
+    }
+    first_buf[first_len] = transition(
+        dst,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
+    first_len += 1;
     let second = [transition(
         dst,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -452,7 +467,7 @@ fn record_clamp_as(
     unsafe {
         // Earlier shader writes (the title's argument and count passes, or a
         // prior clamp's budget update) first.
-        l.ResourceBarrier(&first[first_start..]);
+        l.ResourceBarrier(&first_buf[..first_len]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);

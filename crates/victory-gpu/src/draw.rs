@@ -25,7 +25,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum Root {
     #[default]
     None,
@@ -37,7 +37,7 @@ enum Root {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct VertexView {
     address: u64,
     size: u32,
@@ -45,7 +45,7 @@ pub(crate) struct VertexView {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct IndexView {
     address: u64,
     size: u32,
@@ -614,6 +614,10 @@ impl State {
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
+        if self.topology_set && self.topology == topology {
+            return;
+        }
+        self.touched(list);
         self.topology = topology;
         self.topology_set = true;
         let host = match topology {
@@ -635,14 +639,28 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
-    pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
-        self.heaps = [0; 2];
+    pub(crate) fn set_pipeline_on(&mut self, list: &HostList, pipeline: This) {
+        let next = pipeline as usize;
+        if self.pipeline == next {
+            return;
+        }
+        self.touched(list);
+        self.pipeline = next;
+    }
+
+    pub(crate) fn set_heaps(&mut self, list: &HostList, heaps: &[This]) {
+        let mut next = [0usize; 2];
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
-                self.heaps[usize::from(samplers)] = h as usize;
+                next[usize::from(samplers)] = h as usize;
             }
         }
+        if self.heaps == next {
+            return;
+        }
+        self.touched(list);
+        self.heaps = next;
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
@@ -653,45 +671,79 @@ impl State {
         }
     }
 
-    pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
-        set(self.roots(compute), slot, Root::Table(handle));
+    pub(crate) fn set_table(&mut self, list: &HostList, compute: bool, slot: u32, handle: u64) {
+        let next = Root::Table(handle);
+        if self.roots_ref(compute).get(slot as usize) == Some(&next) {
+            return;
+        }
+        self.touched(list);
+        set(self.roots(compute), slot, next);
     }
 
-    pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
-        set(self.roots(compute), slot, Root::View(address));
+    pub(crate) fn set_view(&mut self, list: &HostList, compute: bool, slot: u32, address: u64) {
+        let next = Root::View(address);
+        if self.roots_ref(compute).get(slot as usize) == Some(&next) {
+            return;
+        }
+        self.touched(list);
+        set(self.roots(compute), slot, next);
     }
 
-    pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
-        let roots = self.roots(compute);
+    pub(crate) fn set_constants(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        slot: u32,
+        values: &[u32],
+        offset: u32,
+    ) {
         let s = slot as usize;
+        let off = offset as usize;
+        let end = off + values.len();
+        if matches!(self.roots_ref(compute).get(s), Some(Root::Constants(c)) if c.get(off..end) == Some(values)) {
+            return;
+        }
+        self.touched(list);
+        let roots = self.roots(compute);
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
             set(roots, slot, Root::Constants(Vec::new()));
         }
         if let Root::Constants(c) = &mut roots[s] {
-            let end = offset as usize + values.len();
             if c.len() < end {
                 c.resize(end, 0);
             }
-            c[offset as usize..end].copy_from_slice(values);
+            c[off..end].copy_from_slice(values);
         }
     }
 
-    pub(crate) fn set_vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
-        for (i, v) in views.iter().enumerate() {
-            if let Some(slot) = self.vertex.get_mut(start as usize + i) {
-                *slot = *v;
-            }
+    pub(crate) fn set_vertex_buffers(&mut self, list: &HostList, start: u32, views: &[VertexView]) {
+        let begin = start as usize;
+        let n = views.len().min(self.vertex.len().saturating_sub(begin));
+        if n == 0 || self.vertex[begin..begin + n] == views[..n] {
+            return;
         }
+        self.touched(list);
+        self.vertex[begin..begin + n].copy_from_slice(&views[..n]);
     }
 
-    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
-            *slot = VertexView::default();
+    pub(crate) fn clear_vertex_buffers(&mut self, list: &HostList, start: u32, count: u32) {
+        let begin = start as usize;
+        let n = (count as usize).min(self.vertex.len().saturating_sub(begin));
+        let empty = VertexView::default();
+        if n == 0 || self.vertex[begin..begin + n].iter().all(|v| *v == empty) {
+            return;
         }
+        self.touched(list);
+        self.vertex[begin..begin + n].fill(empty);
     }
 
-    pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
-        self.index = view.copied().unwrap_or_default();
+    pub(crate) fn set_index_buffer(&mut self, list: &HostList, view: Option<&IndexView>) {
+        let next = view.copied().unwrap_or_default();
+        if self.index == next {
+            return;
+        }
+        self.touched(list);
+        self.index = next;
     }
 
     /// Render targets and depth, set on the host list at once.
@@ -760,12 +812,20 @@ impl State {
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        if self.viewports.as_slice() == viewports {
+            return;
+        }
+        self.touched(list);
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
         crate::draw::viewports(list, viewports);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        if self.scissors.as_slice() == rects {
+            return;
+        }
+        self.touched(list);
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
         if scissor_test() {
@@ -785,32 +845,34 @@ impl State {
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
-        self.blend = factor.copied();
+        let next = factor.copied();
+        if self.blend == next {
+            return;
+        }
+        self.touched(list);
+        self.blend = next;
         crate::draw::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        if self.stencil == Some(reference) {
+            return;
+        }
+        self.touched(list);
         self.stencil = Some(reference);
         crate::draw::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
-        self.depth_bounds = Some([min, max]);
+        let next = Some([min, max]);
+        if self.depth_bounds == next {
+            return;
+        }
+        self.touched(list);
+        self.depth_bounds = next;
         crate::draw::depth_bounds(list, min, max);
     }
 
-    /// `list` is a new host list that continues the title's list (it was
-    /// cut at a wait for a memory value, `crate::list::cut`): a new host
-    /// list has nothing set, so what the title set so far is set again.
-    /// The pipeline, the root signatures and the heaps are set by the next
-    /// draw or dispatch (`bind`, which is told here that the host list has
-    /// none); root arguments, vertex and index buffers are set by every
-    /// draw anyway. The dynamic descriptor slots and the tables made in
-    /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
     /// Clears cached host pipeline, root-signature, and descriptor-heap bindings
     /// so the next draw or dispatch re-binds them.
     pub(crate) fn clear_bindings(&mut self) {
@@ -822,6 +884,7 @@ impl State {
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.clear_bindings();
         if self.topology_set {
+            self.topology_set = false;
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
@@ -1610,6 +1673,9 @@ impl State {
             passes: u64,
             buckets: [BucketMap; 64],
             bucket_spans: [SpanList; 64],
+            merged_spans: SpanList,
+            merged_bytes: u64,
+            view_count: u32,
         }
         impl HeapBufferCache {
             fn new() -> Self {
@@ -1617,6 +1683,9 @@ impl State {
                     passes: 0,
                     buckets: std::array::from_fn(|_| BucketMap::new()),
                     bucket_spans: std::array::from_fn(|_| Vec::new()),
+                    merged_spans: Vec::new(),
+                    merged_bytes: 0,
+                    view_count: 0,
                 }
             }
             fn rebuild_bucket(&mut self, b: usize) {
@@ -1630,6 +1699,21 @@ impl State {
                 }
                 self.bucket_spans[b] = map.into_values().collect();
             }
+            fn rebuild_merged(&mut self) {
+                let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                    std::collections::HashMap::new();
+                for bucket_span in &self.bucket_spans {
+                    for (shadow, from, to) in bucket_span {
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                        span.1 = span.1.min(*from);
+                        span.2 = span.2.max(*to);
+                    }
+                }
+                self.merged_bytes = spans.values().map(|s| s.2 - s.1).sum();
+                self.merged_spans = spans.into_values().collect();
+                self.view_count = self.buckets.iter().map(|b| b.len() as u32).sum();
+            }
         }
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapBufferCache>>> =
             std::sync::Mutex::new(None);
@@ -1640,20 +1724,23 @@ impl State {
             .or_insert_with(HeapBufferCache::new);
         let changed = host.buffer_changes();
         let mut dirty_buckets: u64 = 0;
-        let slots: Vec<(u32, bool)> = if cache.passes == 0 {
+        // Reuse `cached_key` even for slots reported in `changed`: when the title
+        // rewrites a slot with the same descriptor key, `mirror_buffer` returns
+        // `Unchanged` in O(1) without re-resolving `buffer_copy`.
+        let slots: Vec<u32> = if cache.passes == 0 {
             for b in 0..64 {
                 cache.buckets[b].clear();
                 cache.bucket_spans[b].clear();
             }
             dirty_buckets = u64::MAX;
-            host.buffer_slots().into_iter().map(|i| (i, true)).collect()
+            host.buffer_slots()
         } else {
             let bucket = (cache.passes & 63) as usize;
-            let mut batch: Vec<(u32, bool)> = Vec::with_capacity(changed.len() + 2048);
+            let mut batch: Vec<u32> = Vec::with_capacity(changed.len() + 2048);
             let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(changed.len());
             for index in changed {
                 if seen.insert(index) {
-                    batch.push((index, true));
+                    batch.push(index);
                 }
             }
             let rolling = host.buffer_slots_bucket(bucket as u32);
@@ -1665,7 +1752,7 @@ impl State {
             }
             for index in rolling {
                 if seen.insert(index) {
-                    batch.push((index, false));
+                    batch.push(index);
                 }
             }
             batch
@@ -1675,7 +1762,7 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
-        for (n, &(index, force)) in slots.iter().enumerate() {
+        for (n, &index) in slots.iter().enumerate() {
             let b = (index & 63) as usize;
             let Some(handle) = heap.handle(index) else {
                 if cache.buckets[b].remove(&index).is_some() {
@@ -1683,14 +1770,10 @@ impl State {
                 }
                 continue;
             };
-            let cached_key = if force {
-                0
-            } else {
-                cache.buckets[b]
-                    .get(&index)
-                    .filter(|(_, s, _, _)| !s.in_place())
-                    .map_or(0, |(k, _, _, _)| *k)
-            };
+            let cached_key = cache.buckets[b]
+                .get(&index)
+                .filter(|(_, s, _, _)| !s.in_place())
+                .map_or(0, |(k, _, _, _)| *k);
             let (key, view) = match host.mirror_buffer(index, handle, cached_key) {
                 crate::descriptor::host::BufferMirror::Unchanged => continue,
                 crate::descriptor::host::BufferMirror::Empty => {
@@ -1710,7 +1793,7 @@ impl State {
                 GONE.store(true, Ordering::Relaxed);
                 let last: Vec<String> = slots[n - 63..=n]
                     .iter()
-                    .filter_map(|&(i, _)| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
                     .map(|s| s.chars().take(200).collect())
                     .collect();
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
@@ -1737,21 +1820,13 @@ impl State {
             mask &= mask - 1;
             cache.rebuild_bucket(b);
         }
-        let views: u32 = cache.buckets.iter().map(|b| b.len() as u32).sum();
-        // Per host copy, the span its picked views cover (merged from 64
-        // pre-aggregated bucket span lists instead of scanning all slots).
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for bucket_span in &cache.bucket_spans {
-            for (shadow, from, to) in bucket_span {
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-                span.1 = span.1.min(*from);
-                span.2 = span.2.max(*to);
-            }
+        if dirty_buckets != 0 || cache.merged_spans.is_empty() {
+            cache.rebuild_merged();
         }
+        let views = cache.view_count;
+        let bytes = cache.merged_bytes;
+        let spans = cache.merged_spans.clone();
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1760,30 +1835,34 @@ impl State {
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_UNWATCHED_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
+        let to_refresh: Vec<(&std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = {
+            let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+            let whole = whole.get_or_insert_with(Default::default);
+            spans
+                .iter()
+                .filter_map(|(shadow, from, to)| {
+                    if shadow.unwatched() {
+                        let key = shadow.id() as usize;
+                        match whole.get(&key) {
+                            Some(&last) if frame < last + every => return None,
+                            _ => {
+                                whole.insert(key, frame);
+                            }
+                        }
                     }
-                }
-            }
-            shadow.refresh(list, *from, to - from);
-        }
+                    let len = (to - from).min(shadow.left(*from));
+                    Some((shadow, *from as usize, len as usize))
+                })
+                .collect()
+        };
+        list.defer_refreshes(to_refresh);
         let elapsed = started.elapsed();
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
