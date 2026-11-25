@@ -45,6 +45,107 @@ thread_local! {
 static EMULATED: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 static ZEROED: AtomicU64 = AtomicU64::new(0);
+/// Instructions emulated by kind, in [`kind_of`]'s order.
+static BY_KIND: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const KINDS: [&str; 9] = ["clwb", "clzero", "clzero loop", "rdpru", "monitorx", "mwaitx", "rdpid", "extrq", "insertq"];
+
+fn kind_of(what: &ConsoleOnly) -> usize {
+    match what {
+        ConsoleOnly::Clwb | ConsoleOnly::Ud2 => 0,
+        ConsoleOnly::Clzero => 1,
+        ConsoleOnly::ClzeroLoop { .. } => 2,
+        ConsoleOnly::Rdpru => 3,
+        ConsoleOnly::Monitorx => 4,
+        ConsoleOnly::Mwaitx => 5,
+        ConsoleOnly::Rdpid(_) => 6,
+        ConsoleOnly::Extrq { .. } => 7,
+        ConsoleOnly::Insertq { .. } => 8,
+    }
+}
+
+/// Whether `monitorx` and `mwaitx` are patched where they stand at their first exception
+/// ([`patch_wait`]). On by default; `VICTORY_WAIT_PATCH=0` emulates each one every time, as
+/// before.
+///
+/// The title's wait loops watch a line of memory with `monitorx` and pause in `mwaitx` until it
+/// is written or a time is up; a loop turns thousands of times while it waits. Emulated, every
+/// one of the two was an exception, a trip into Windows and back: 380,000 a second in the
+/// world (33.5 million in four minutes), and the title's busiest thread spent 68 % of its
+/// processor time in the dispatch of exceptions (a stack sample of 25 s, 9.9 s of its 14.5 s).
+/// What the emulation did for them was nothing and a `pause`; the patch does the same with no
+/// exception.
+fn patches_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_PATCH").is_none_or(|v| v != "0"))
+}
+
+/// `monitorx` / `mwaitx` sites patched so far.
+static WAITS_PATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// What takes the place of the three bytes of `monitorx` (`0F 01 FA`) or `mwaitx`
+/// (`0F 01 FB`) at `at`, and how many bytes of it are written: other threads may be running
+/// the instruction while it is patched, so the write must be one they see whole or not at all.
+///
+/// Where the three bytes and the one after lie in one cache line, they are written as one
+/// 32-bit store (the fourth byte as it was): a three-byte NOP for `monitorx`, `pause` and a NOP
+/// for `mwaitx`. Where they do not, only the first byte is written, a single store: `EB`, which
+/// with the `01` after it is a jump over the third byte, for either instruction (no pause then).
+fn wait_patch(at: usize, wait: bool) -> ([u8; 3], usize) {
+    if at & 63 <= 60 {
+        (if wait { [0xF3, 0x90, 0x90] } else { [0x0F, 0x1F, 0x00] }, 3)
+    } else {
+        ([0xEB, 0x01, 0x00], 1)
+    }
+}
+
+/// Patches the `monitorx` (`wait` false) or `mwaitx` at `rip` ([`wait_patch`]), if it has no
+/// prefix and is still there.
+///
+/// # Safety
+/// `rip` is where an exception found that instruction, `len` its length.
+unsafe fn patch_wait(rip: usize, len: usize, wait: bool) {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if !patches_waits() || len != 3 {
+        return;
+    }
+    // One at a time: two threads at one site would each put back the protection the other
+    // had set.
+    static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let was = [0x0F, 0x01, if wait { 0xFB } else { 0xFA }];
+    let (bytes, n) = wait_patch(rip, wait);
+    // SAFETY: the instruction's own bytes, read, made writable for the patch and put back as
+    // they were protected; the 32-bit store stays inside the instruction's cache line.
+    unsafe {
+        if std::slice::from_raw_parts(rip as *const u8, 3) != was {
+            return; // another thread patched it meanwhile
+        }
+        let span = if n == 3 { 4 } else { 1 };
+        let mut old = 0u32;
+        if VirtualProtect(rip as *const _, span, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return;
+        }
+        if n == 3 {
+            let after = (rip as *const u8).add(3).read();
+            (rip as *mut u32).write_unaligned(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], after]));
+        } else {
+            (rip as *mut u8).write(bytes[0]);
+        }
+        VirtualProtect(rip as *const _, span, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), rip as *const _, span);
+    }
+    let patched = WAITS_PATCHED.fetch_add(1, Relaxed) + 1;
+    if patched <= 16 {
+        tracing::info!(
+            at = format_args!("{rip:#x}"),
+            instruction = if wait { "mwaitx" } else { "monitorx" },
+            whole = n == 3,
+            "a console wait instruction patched where it stands: no exception there again"
+        );
+    }
+}
 
 fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
@@ -149,8 +250,13 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        // SAFETY: the instruction the exception was raised at.
+        ConsoleOnly::Monitorx => unsafe { patch_wait(rip, len, false) },
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+            // SAFETY: as above.
+            unsafe { patch_wait(rip, len, true) };
+        }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
@@ -235,15 +341,50 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
     }
     ctx.Rip += len as u64;
+    BY_KIND[kind_of(&what)].fetch_add(1, Relaxed);
     // How often this runs at all (each one is an exception: a trip into Windows and back).
     let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
     if emulated >= 1 << 16 && emulated.is_power_of_two() {
+        let by_kind: Vec<String> = KINDS
+            .iter()
+            .zip(&BY_KIND)
+            .map(|(name, n)| (name, n.load(Relaxed)))
+            .filter(|&(_, n)| n > 0)
+            .map(|(name, n)| format!("{name} {n}"))
+            .collect();
         tracing::info!(
             emulated,
+            by_kind = by_kind.join(", "),
+            waits_patched = WAITS_PATCHED.load(Relaxed),
             asked = ASKED.load(Relaxed),
             zeroed_mb = ZEROED.load(Relaxed) >> 20,
             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
         );
     }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_patch;
+
+    /// Within one cache line the whole instruction is replaced in one store: a NOP of three
+    /// bytes for `monitorx`, `pause` and a NOP for `mwaitx`.
+    #[test]
+    fn a_wait_instruction_in_one_cache_line_is_replaced_whole() {
+        for at in [0x1000usize, 0x1001, 0x103c] {
+            assert_eq!(wait_patch(at, false), ([0x0F, 0x1F, 0x00], 3));
+            assert_eq!(wait_patch(at, true), ([0xF3, 0x90, 0x90], 3));
+        }
+    }
+
+    /// Where the instruction and the byte after it reach into the next cache line, only its
+    /// first byte changes: with the `01` that follows, a jump over the third byte.
+    #[test]
+    fn a_wait_instruction_across_cache_lines_gets_one_byte() {
+        for at in [0x103dusize, 0x103e, 0x103f] {
+            assert_eq!(wait_patch(at, false), ([0xEB, 0x01, 0x00], 1));
+            assert_eq!(wait_patch(at, true), ([0xEB, 0x01, 0x00], 1));
+        }
+    }
 }

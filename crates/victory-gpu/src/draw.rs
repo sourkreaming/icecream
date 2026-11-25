@@ -811,10 +811,16 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
-    pub(crate) fn replay(&mut self, list: &HostList) {
+    /// Clears cached host pipeline, root-signature, and descriptor-heap bindings
+    /// so the next draw or dispatch re-binds them.
+    pub(crate) fn clear_bindings(&mut self) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+    }
+
+    pub(crate) fn replay(&mut self, list: &HostList) {
+        self.clear_bindings();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -967,18 +973,16 @@ impl State {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
-        let u = stage.translated().used.iter().find(|u| {
-            u.kind == ResourceType::Uav
-                && u.root == RootType::Table
-                && (u.slot, u.table_offset_dwords) == crate::ambient::LIGHT
-        });
-        let Some(u) = u else {
-            return false;
+        let view = |kind, (slot, offset)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let &Root::Table(table) = self.roots_ref(true).get(usize::from(u.slot))? else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
-        let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
-            return false;
-        };
-        let light = match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+        let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
@@ -986,7 +990,11 @@ impl State {
             once!("no ambient light: other tables");
             return false;
         }
-        crate::ambient::apply(list, light as This)
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::apply(list, light as This, depth)
     }
 
     /// The bound heap holding `handle`.
@@ -2404,7 +2412,7 @@ impl State {
         unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
-            self.replay(list);
+            self.clear_bindings();
         }
     }
 

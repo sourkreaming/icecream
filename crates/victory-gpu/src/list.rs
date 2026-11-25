@@ -1313,7 +1313,11 @@ extern "system" fn copy_texture_region(
             same = texture.as_raw() == to.as_raw()
                 && src.kind != FOOTPRINT
                 && dst.kind != FOOTPRINT
-                && src.footprint.offset as u32 == dst.footprint.offset as u32;
+                && src.footprint.offset as u32 == dst.footprint.offset as u32
+                && x == 0
+                && y == 0
+                && z == 0
+                && source_box.is_null();
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);

@@ -269,19 +269,23 @@ impl Queue {
     }
 
     fn pop(&mut self, screen_only: bool) -> Option<Arc<Pending>> {
-        let pick = |req: &mut VecDeque<Arc<Pending>>, early: &mut VecDeque<Arc<Pending>>| {
-            req.pop_front().or_else(|| {
-                std::iter::from_fn(|| early.pop_front())
-                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-            })
+        let take_early = |early: &mut VecDeque<Arc<Pending>>| {
+            // An early entry can have been promoted and claimed already.
+            std::iter::from_fn(|| early.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
-        // Screen workers exclusively drain screen passes; ordinary workers prefer
-        // screen passes too if any are waiting, otherwise ordinary requested -> early.
+        // Screen workers exclusively drain screen passes; ordinary workers drain
+        // requested passes (screen first, then all) before any early pass.
         let p = if screen_only {
-            pick(&mut self.screen_requested, &mut self.screen_early)?
+            self.screen_requested
+                .pop_front()
+                .or_else(|| take_early(&mut self.screen_early))?
         } else {
-            pick(&mut self.screen_requested, &mut self.screen_early)
-                .or_else(|| pick(&mut self.requested, &mut self.early))?
+            self.screen_requested
+                .pop_front()
+                .or_else(|| self.requested.pop_front())
+                .or_else(|| take_early(&mut self.screen_early))
+                .or_else(|| take_early(&mut self.early))?
         };
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
@@ -322,14 +326,14 @@ fn next(screen_only: bool) -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8, plus 2 dedicated
-/// screen-pass workers) on first use.
+/// Starts the workers (half the logical processors, 2 to 8, plus 1 dedicated
+/// screen-pass worker) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for (i, screen_only) in (0..workers).map(|i| (i, false)).chain((0..2).map(|i| (50 + i, true))) {
+        for (i, screen_only) in (0..workers).map(|i| (i, false)).chain([(50, true)]) {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
@@ -426,5 +430,25 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
         assert!(queue.pop(false).is_none());
+    }
+
+    #[test]
+    fn requested_beats_early_screen_passes() {
+        let mut early_screen = Pending::new(Vec::new(), None);
+        early_screen.screen = true;
+        let early_screen = Arc::new(early_screen);
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut requested_screen = Pending::new(Vec::new(), None);
+        requested_screen.screen = true;
+        let requested_screen = Arc::new(requested_screen);
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&early_screen, EARLY), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
+        assert_eq!(queue.push(&requested_screen, REQUESTED), Some(true));
+
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested_screen));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &early_screen));
     }
 }
