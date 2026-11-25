@@ -72,7 +72,7 @@ fn tint() -> [f32; 3] {
 fn shade() -> [f32; 4] {
     static SET: OnceLock<[f32; 4]> = OnceLock::new();
     *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6, 0.1, 0.45];
+        let mut shade = [0.5, 0.6, 0.1, 0.45];
         let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
         for (to, v) in shade.iter_mut().zip(set.split(',')) {
             if let Ok(v) = v.trim().parse() {
@@ -122,6 +122,9 @@ float open_to_light(int2 p, float2 size) {
     }
     return saturate(1.0 - strength * 2.0 * sum / N);
 }
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
 uint pack(float3 c) {
     c = clamp(c, 0.0, 65408.0);
     float most = max(c.r, max(c.g, c.b));
@@ -138,7 +141,14 @@ void main(uint3 at : SV_DispatchThreadID) {
     light.GetDimensions(w, h);
     if (at.x >= w || at.y >= h) return;
     float open = strength > 0.0 ? open_to_light(int2(at.xy), float2(w, h)) : 1.0;
-    light[at.xy] = pack(tint * level * open);
+    float3 floor_light = tint * level * open;
+    float3 existing = unpack(light[at.xy]);
+    float peak = max(existing.r, max(existing.g, existing.b));
+    // Reject NaN/Inf/spikes and uninitialized magenta probe garbage while keeping
+    // valid brighter bounce (such as sky/water scatter).
+    bool garbage = (peak != peak) || peak > 64.0
+        || (existing.r > existing.g * 2.2 + 0.05 && existing.b > existing.g * 2.2 + 0.05);
+    light[at.xy] = pack(garbage ? floor_light : max(existing, floor_light));
 }
 "#;
 
