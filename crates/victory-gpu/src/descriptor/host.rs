@@ -1914,13 +1914,84 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
+    /// Whether `sync_heaps` also mirrors slots drawn through tables lately
+    /// (`VICTORY_HEAP_SYNC_TABLES=1`; off by default).
+    fn sync_tables() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_TABLES").is_some_and(|v| v == "1"))
+    }
+
+    /// Fast 64-bit fingerprint of a descriptor record (16 or 32 bytes).
+    fn record_print(record: &[u8]) -> u64 {
+        const K: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut h = K ^ record.len() as u64;
+        let mut words = record.chunks_exact(8);
+        for word in &mut words {
+            let w = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+            h = (h ^ w).wrapping_mul(K);
+            h ^= h >> 29;
+        }
+        for &b in words.remainder() {
+            h = (h ^ u64::from(b)).wrapping_mul(K);
+        }
+        h ^ (h >> 32)
+    }
+
+    /// [`HostHeap::mirror_copied`] for every record of one changed page of
+    /// the title's heap (`super::sync_heaps`): locks `self.copied` once per page,
+    /// skips unchanged fingerprints before checking `tabled_lately`, and mirrors
+    /// dirty records afterwards in slot order.
+    pub(crate) fn mirror_copied_page(
+        &self,
+        slots: std::ops::Range<u64>,
+        (start, step): (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), Self::sync_tables());
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for index in slots {
+                let handle = start + index * step;
+                let Some(at) = (handle as usize).checked_sub(from) else {
+                    continue;
+                };
+                let Some(record) = page.get(at..at + step as usize) else {
+                    continue;
+                };
+                looked += 1;
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                let print = Self::record_print(record) | 1;
+                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                    continue;
+                }
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    continue;
+                }
+                *last = print;
+                due.push((index as u32, handle));
+            }
+        }
+        for &(index, handle) in &due {
+            self.mirror(index, handle, false);
+        }
+        (looked, due.len() as u64)
+    }
+
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
         if index >= self.count {
             return false;
         }
         let n = record.len();
         // Never 0, which is "never looked at".
-        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        let print = Self::record_print(record) | 1;
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -1931,6 +2002,9 @@ impl HostHeap {
             };
             // A slot never looked at that holds nothing: as it was.
             if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
+                return false;
+            }
+            if !Self::sync_tables() && self.tabled_lately(index, crate::frame::current()) {
                 return false;
             }
             *last = print;

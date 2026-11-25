@@ -265,6 +265,15 @@ impl GraphicsState {
         }
     }
 
+    /// Whether these are a pass over the screen's draws: no vertex input, no
+    /// depth or stencil. Such passes fill lighting tables once; their shaders are few.
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs

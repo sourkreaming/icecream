@@ -1489,7 +1489,10 @@ fn room_for(filled: u64, video: Option<[u64; 4]>, percent: u64, reserve: u64) ->
     const WITHOUT_BUDGET: u64 = 4 << 30;
     match video {
         Some([budget, used, shared_budget, shared_used]) => {
-            if budget > 0 && used >= budget / 100 * 88 {
+            // Respect explicit higher `VICTORY_TEXTURE_ROOM_PERCENT` settings
+            // (e.g. 92% on 6 GiB GPUs) instead of hard-clamping at 88%.
+            let hard_cap = percent.max(88);
+            if budget > 0 && used >= budget / 100 * hard_cap {
                 return false;
             }
             if shared_budget > 0 && shared_used >= shared_budget / 100 * 96 {

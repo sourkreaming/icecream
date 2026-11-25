@@ -2585,10 +2585,70 @@ fn land() {
 /// at the next call that settles, and a title thread that polls such a
 /// value while the submitting thread waits for that thread would never
 /// see it.
+/// Asks the system to run the calling thread on fast efficiency-class cores
+/// on hybrid CPUs (`VICTORY_FAST_CORES=0` disables).
+fn keep_on_fast_cores(what: &str) {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, SetThreadSelectedCpuSets,
+    };
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_FAST_CORES").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let mut bytes = 0u32;
+    // SAFETY: size query followed by buffer fill of exact returned size.
+    unsafe { GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0) };
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    let ok = unsafe {
+        GetSystemCpuSetInformation(
+            buffer.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+            GetCurrentProcess(),
+            0,
+        )
+    };
+    let mut sets = Vec::new();
+    let mut at = 0usize;
+    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
+        // SAFETY: valid CPU set record inside `buffer`.
+        let info = unsafe {
+            &*(buffer
+                .as_ptr()
+                .cast::<u8>()
+                .add(at)
+                .cast::<SYSTEM_CPU_SET_INFORMATION>())
+        };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: `CpuSet` variant matches `SYSTEM_CPU_SET_INFORMATION`.
+        let set = unsafe { &info.Anonymous.CpuSet };
+        if set.Group == 0 {
+            sets.push((set.Id, set.EfficiencyClass));
+        }
+        at += info.Size as usize;
+    }
+    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+    let fast: Vec<u32> = sets.iter().filter(|c| c.1 == best).map(|c| c.0).collect();
+    if fast.is_empty() || fast.len() == sets.len() {
+        return;
+    }
+    // SAFETY: our own thread and system CPU-set IDs.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), fast.as_ptr(), fast.len() as u32) };
+    if ok != 0 {
+        tracing::info!(thread = what, cores = fast.len(), "pinned worker to fast P-cores");
+    }
+}
+
 fn late_helper() {
     let Some(host) = host() else {
         return;
     };
+    keep_on_fast_cores("victory-late-wait");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
@@ -2711,6 +2771,7 @@ fn relay_worker() {
     let Some(host) = host() else {
         return;
     };
+    keep_on_fast_cores("victory-relay");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
@@ -6365,7 +6426,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6445,7 +6506,8 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len())
+        || read(src, dst.as_mut_ptr(), dst.len())
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -6735,6 +6797,7 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::plaincopy::line(frames);
         late_line(frames);
         crate::draw::batch_line(frames);
         card_clock_line(frames, ms);

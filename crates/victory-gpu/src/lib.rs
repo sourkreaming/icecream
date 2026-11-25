@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -38,6 +40,8 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod plaincopy;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

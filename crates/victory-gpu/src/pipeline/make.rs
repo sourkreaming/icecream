@@ -29,6 +29,9 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    /// A pass over the screen (`GraphicsState::screen_pass`): gets dedicated
+    /// workers and a 20 s wait budget so one-shot lighting LUT passes are never dropped.
+    screen: bool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -50,6 +53,7 @@ impl Pending {
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -164,18 +168,25 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Wait budget for passes over the screen (under the title's 30 s watchdog).
+const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
-    let budget = wait_budget();
+    let budget = if p.screen { SCREEN_BUDGET } else { wait_budget() };
     if budget.is_zero() {
         return;
     }
+    let kind = usize::from(p.screen);
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now).
-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    // taken by a thread waiting now), separated for normal and screen passes.
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [
+        Mutex::new((u64::MAX, Duration::ZERO)),
+        Mutex::new((u64::MAX, Duration::ZERO)),
+    ];
     let shared = shared_budget();
     let left = {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = SPENT[kind].lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -201,7 +212,7 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     {
-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut spent = SPENT[kind].lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
             if shared {
@@ -226,6 +237,8 @@ const MAKING: u8 = 3;
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    screen_early: VecDeque<Arc<Pending>>,
+    screen_requested: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -233,6 +246,8 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            screen_early: VecDeque::new(),
+            screen_requested: VecDeque::new(),
         }
     }
 
@@ -244,20 +259,30 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match (p.screen, priority == REQUESTED) {
+            (true, true) => self.screen_requested.push_back(p.clone()),
+            (true, false) => self.screen_early.push_back(p.clone()),
+            (false, true) => self.requested.push_back(p.clone()),
+            (false, false) => self.early.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    fn pop(&mut self, screen_only: bool) -> Option<Arc<Pending>> {
+        let pick = |req: &mut VecDeque<Arc<Pending>>, early: &mut VecDeque<Arc<Pending>>| {
+            req.pop_front().or_else(|| {
+                std::iter::from_fn(|| early.pop_front())
+                    .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            })
+        };
+        // Screen workers exclusively drain screen passes; ordinary workers prefer
+        // screen passes too if any are waiting, otherwise ordinary requested -> early.
+        let p = if screen_only {
+            pick(&mut self.screen_requested, &mut self.screen_early)?
+        } else {
+            pick(&mut self.screen_requested, &mut self.screen_early)
+                .or_else(|| pick(&mut self.requested, &mut self.early))?
+        };
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -283,30 +308,31 @@ fn start(p: &Arc<Pending>, priority: u8) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        AVAILABLE.notify_one();
+        AVAILABLE.notify_all();
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next(screen_only: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(screen_only) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (half the logical processors, 2 to 8, plus 2 dedicated
+/// screen-pass workers) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
+        for (i, screen_only) in (0..workers).map(|i| (i, false)).chain((0..2).map(|i| (50 + i, true))) {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -314,7 +340,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        next(screen_only).make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -395,10 +421,10 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
     }
 }
