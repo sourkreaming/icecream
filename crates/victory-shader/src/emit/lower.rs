@@ -6547,16 +6547,37 @@ impl<'a> Lower<'a> {
             let f32t = self.s.t.f32;
             let x = match numeric {
                 Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                    let top = (1u64 << w) - 1;
+                    let q = if w <= 16 {
+                        let q = self.norm_quotient(field, w);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    let (high, one) = (self.s.m.i32(top as u32), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::EQ, field, high);
+                    let q = self.s.m.select(c, at_top, one, q);
                     float(self, q)
                 }
                 Numeric::Snorm => {
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                    let top = (1u32 << (w - 1)) - 1;
+                    let q = if w <= 17 {
+                        let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
+                        let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                        let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                        let m = self.s.m.select(c, neg, minus, s);
+                        let q = self.norm_quotient(m, w - 1);
+                        let sign = self.s.m.select(c, neg, sign, zero);
+                        let q = self.s.m.bin(c, Bin::Or, q, sign);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
                     let lo = self.s.m.f32((-1.0f32).to_bits());
                     let q = self.binary(35, q, lo);
                     float(self, q)
@@ -6598,6 +6619,115 @@ impl<'a> Lower<'a> {
         }
         out.truncate(channels as usize);
         Ok(out)
+    }
+
+    /// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
+    /// `0 <= a < d` and `w <= 16`: what the console's buffer unit gives for
+    /// a normalized code.
+    fn norm_quotient(&mut self, a: V, w: u32) -> V {
+        if matches!(w, 11 | 12) {
+            return self.exact_norm(a, w);
+        }
+        let c = self.cur;
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
+        let (one, kv) = (k(self, 1), k(self, kk));
+        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+        if r != 1 {
+            let (rv, dv) = (k(self, r), k(self, d));
+            let t = self.s.m.bin(c, Bin::Mul, a, rv);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            q = self.s.m.bin(c, Bin::Add, q, more);
+        }
+        let k8 = k(self, 8);
+        let top = self.s.m.bin(c, Bin::LShr, q, k8);
+        let top = self.s.m.cast(c, Cast::UiToFp, top, self.s.t.f32);
+        let top = self.as_int(top);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::LShr, top, k23);
+        let bias = k(self, 127 + 15);
+        let shift = self.s.m.bin(c, Bin::Sub, e, bias);
+        let (zero, b24) = (k(self, 0), k(self, 1 << 24));
+        let fits = self.s.m.cmp(c, pred::IULT, q, b24);
+        let shift = self.s.m.select(c, fits, zero, shift);
+        let up = self.s.m.bin(c, Bin::Shl, q, one);
+        let up = self.s.m.bin(c, Bin::LShr, up, shift);
+        let up = self.s.m.bin(c, Bin::And, up, one);
+        let m = self.s.m.bin(c, Bin::LShr, q, shift);
+        let m = self.s.m.bin(c, Bin::Add, m, up);
+        let f = self.s.m.cast(c, Cast::UiToFp, m, self.s.t.f32);
+        let b95 = k(self, 127 - 32);
+        let scale = self.s.m.bin(c, Bin::Add, shift, b95);
+        let scale = self.s.m.bin(c, Bin::Shl, scale, k23);
+        let scale = self.as_float(scale);
+        let f = self.s.m.bin(c, Bin::Mul, f, scale);
+        self.as_int(f)
+    }
+
+    /// [`Self::norm_quotient`] in integers only, for widths 11 and 12.
+    fn exact_norm(&mut self, a: V, w: u32) -> V {
+        let c = self.cur;
+        let d = (1u64 << w) - 1;
+        let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+        let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
+        let (one, zero, dv, k8) = (k(self, 1), k(self, 0), k(self, d), k(self, 8));
+        let kv = k(self, kk);
+        let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+        let mut rem = a;
+        if r != 1 {
+            let rv = k(self, r);
+            let t = self.s.m.bin(c, Bin::Mul, a, rv);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            q = self.s.m.bin(c, Bin::Add, q, more);
+            rem = self.s.m.bin(c, Bin::URem, t, dv);
+        }
+        let mut bias = k(self, 127 + 23 - 32);
+        if kk < 1 << 24 {
+            let t = self.s.m.bin(c, Bin::Shl, rem, k8);
+            let more = self.s.m.bin(c, Bin::UDiv, t, dv);
+            let rest = self.s.m.bin(c, Bin::URem, t, dv);
+            let wide = self.s.m.bin(c, Bin::Shl, q, k8);
+            let wide = self.s.m.bin(c, Bin::Or, wide, more);
+            let limit = k(self, 1 << 24);
+            let small = self.s.m.cmp(c, pred::IULT, q, limit);
+            q = self.s.m.select(c, small, wide, q);
+            rem = self.s.m.select(c, small, rest, rem);
+            let b40 = k(self, 127 + 23 - 40);
+            bias = self.s.m.select(c, small, b40, bias);
+        }
+        let mut shift = one;
+        for bit in 25..32 {
+            let at = k(self, 1 << bit);
+            let ge = self.s.m.cmp(c, pred::IUGE, q, at);
+            let add = self.s.m.select(c, ge, one, zero);
+            shift = self.s.m.bin(c, Bin::Add, shift, add);
+        }
+        let mant = self.s.m.bin(c, Bin::LShr, q, shift);
+        let below = self.s.m.bin(c, Bin::Sub, shift, one);
+        let half = self.s.m.bin(c, Bin::LShr, q, below);
+        let half = self.s.m.bin(c, Bin::And, half, one);
+        let low = self.s.m.bin(c, Bin::Shl, one, below);
+        let low = self.s.m.bin(c, Bin::Sub, low, one);
+        let low = self.s.m.bin(c, Bin::And, q, low);
+        let rest = self.s.m.bin(c, Bin::Or, low, rem);
+        let sticky = self.s.m.cmp(c, pred::NE, rest, zero);
+        let odd = self.s.m.bin(c, Bin::And, mant, one);
+        let tie = self.s.m.select(c, sticky, one, odd);
+        let up = self.s.m.bin(c, Bin::And, half, tie);
+        let mant = self.s.m.bin(c, Bin::Add, mant, up);
+        let k24 = k(self, 24);
+        let carry = self.s.m.bin(c, Bin::LShr, mant, k24);
+        let mant = self.s.m.bin(c, Bin::LShr, mant, carry);
+        let e = self.s.m.bin(c, Bin::Add, bias, shift);
+        let e = self.s.m.bin(c, Bin::Add, e, carry);
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::Shl, e, k23);
+        let fraction = k(self, 0x7F_FFFF);
+        let m = self.s.m.bin(c, Bin::And, mant, fraction);
+        let bits = self.s.m.bin(c, Bin::Or, e, m);
+        let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
+        self.s.m.select(c, is_zero, zero, bits)
     }
 
     /// Whether `value` is defined as a VGPR (program input, phi, or instruction
@@ -7123,8 +7253,13 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Quad permutations and DPP8 (when every lane reads within its own
+        // 4-lane quad) stay in groups the pixel layout shares.
+        let quad = match dpp {
+            Dpp::Row { ctrl: 0..=0xFF, .. } => true,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+            _ => false,
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -10449,11 +10584,9 @@ impl<'a> Lower<'a> {
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // log2 = natural logarithm / ln 2; a length of 0 gives
+                    // DXIL Log already returns log2; a length of 0 gives
                     // minus infinity, which the sampler clamps to level 0.
-                    let ln = self.unary(23, texels);
-                    let per_ln2 = self.s.m.f32(std::f32::consts::LOG2_E.to_bits());
-                    let lod = self.s.m.bin(c, Bin::Mul, ln, per_ln2);
+                    let lod = self.unary(23, texels);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(

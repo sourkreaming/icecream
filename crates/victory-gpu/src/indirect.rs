@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host, transition, uav_barrier};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -36,7 +36,9 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: the records are gathered
+    // (`gather`): record i lies in the source where word i of the table
+    // behind `count_buf` says (from `count_offset` on), and goes to slot i.
     uint has_count;
     uint count_offset;
     uint dst_offset;
@@ -60,6 +62,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
+    [branch]
+    if ((has_count & 4u) != 0) {
+        src_at = count_buf.Load(count_offset + id.x * 4u);
+    }
     uint dst_at = dst_offset + id.x * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
@@ -499,6 +505,226 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// The most records of one argument buffer gathered for a list
+/// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
+/// threads past the last record read inside the table.
+pub(crate) const GATHER_MOST: u32 = 4096;
+/// The widest record gathered: its slot in the scratch buffer.
+pub(crate) const GATHER_STRIDE: u32 = 32;
+
+/// The records of one argument buffer that a list's draws read, to be
+/// clamped in one pass before the list runs ([`gather`]): the buffer (a
+/// host copy, and its number), the records' kind and stride, the scratch
+/// buffer whose slot `i` holds record `i` clamped, and the table of the
+/// records' offsets in the buffer (upload memory of the list).
+pub(crate) struct GatherSet {
+    pub(crate) src: ID3D12Resource,
+    pub(crate) src_id: u64,
+    pub(crate) kind: u32,
+    pub(crate) stride: u32,
+    pub(crate) scratch: ID3D12Resource,
+    table_gpu: u64,
+    table: usize,
+    /// A record's offset in the buffer, and its slot.
+    slots: std::collections::HashMap<u32, u32>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the table is the list's own
+// upload memory, written under the list's lock before the list is submitted.
+unsafe impl Send for GatherSet {}
+
+impl GatherSet {
+    pub(crate) fn new(
+        src: ID3D12Resource,
+        src_id: u64,
+        (kind, stride): (u32, u32),
+        scratch: ID3D12Resource,
+        (table_gpu, table): (u64, *mut u8),
+    ) -> Self {
+        Self {
+            src,
+            src_id,
+            kind,
+            stride,
+            scratch,
+            table_gpu,
+            table: table as usize,
+            slots: Default::default(),
+        }
+    }
+
+    /// The records gathered so far.
+    pub(crate) fn records(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
+    /// The slot of the record at `offset`: the one it has, or the next
+    /// free one. None when the set is full.
+    pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
+        if let Some(&slot) = self.slots.get(&offset) {
+            return Some(slot);
+        }
+        let slot = self.slots.len() as u32;
+        if slot >= GATHER_MOST {
+            return None;
+        }
+        // SAFETY: the table holds `GATHER_MOST` words.
+        unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
+        self.slots.insert(offset, slot);
+        Some(slot)
+    }
+
+    /// The scratch buffer `src`'s set uses, to keep for the list's next recording.
+    pub(crate) fn into_scratch(self) -> ID3D12Resource {
+        self.scratch
+    }
+}
+
+/// Whether [`gather`] can take a record of `kind` and `stride` at `offset`
+/// of a buffer at `src_gpu`.
+pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) -> Option<u32> {
+    let min = min_stride(kind)?;
+    if stride < min
+        || stride > GATHER_STRIDE
+        || !stride.is_multiple_of(4)
+        || !offset.is_multiple_of(4)
+        || !src_gpu.is_multiple_of(4)
+    {
+        return None;
+    }
+    u32::try_from(offset)
+        .ok()
+        .filter(|o| o.checked_add(stride).is_some())
+}
+
+/// For a single scattered record at `offset` of `src` that misses its window:
+/// allocates a slot in a per-list scratch buffer filled once in `HostList::prelude`.
+pub(crate) fn gather(
+    list: &HostList,
+    (src, src_id): (&ID3D12Resource, u64),
+    offset: u64,
+    spec: (u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    clamp()?;
+    // SAFETY: a live D3D12 buffer resource.
+    let Some(offset) = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec) else {
+        GATHER_NONE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    list.gather_slot(src, src_id, offset, spec)
+}
+
+/// Reasons a record could not be gathered: bad fit, closed list, too many buffers,
+/// set full, buffer allocation failure.
+pub(crate) static GATHER_NONE: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Records the clamp of `records` gathered records into `dst` (in `before` state)
+/// and transitions `dst` to `INDIRECT_ARGUMENT`.
+fn record_gather_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: &ID3D12Resource,
+    table_gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> bool {
+    // SAFETY: live D3D12 buffer resources.
+    let (src_gpu, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    if gatherable(src_gpu, 0, (kind, stride)).is_none()
+        || records == 0
+        || records > GATHER_MOST
+        || !dst_gpu.is_multiple_of(4)
+        || !budget.is_multiple_of(4)
+        || !table_gpu.is_multiple_of(4)
+    {
+        return false;
+    }
+    let constants = [kind, stride, records, 0u32, 4u32, 0u32, 0u32];
+    let first = [
+        uav_barrier(None),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    ];
+    let second = [
+        uav_barrier(None),
+        transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // table, scratch destination and budget buffers.
+    unsafe {
+        l.ResourceBarrier(&first);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, table_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&second);
+    }
+    true
+}
+
+/// Records, into a list's prelude `l`, the passes that fill the scratch
+/// buffers of `sets` ([`gather`]), zeroing `budget` first.
+pub(crate) fn record_gathers(
+    l: &ID3D12GraphicsCommandList,
+    sets: &[GatherSet],
+    budget: &ID3D12Resource,
+) -> bool {
+    use windows::core::Interface;
+    let (Some(c), Ok(l2)) = (clamp(), l.cast::<ID3D12GraphicsCommandList2>()) else {
+        return false;
+    };
+    // SAFETY: a live buffer.
+    let at = unsafe { budget.GetGPUVirtualAddress() };
+    let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        Dest: at + offset,
+        Value: 0,
+    });
+    // SAFETY: an open list; `budget` is common between list runs.
+    unsafe {
+        l.ResourceBarrier(&[transition(
+            budget,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+        l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+        l.ResourceBarrier(&[transition(
+            budget,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
+    let mut all = true;
+    for set in sets.iter().filter(|s| s.records() > 0) {
+        all &= record_gather_as(
+            c,
+            l,
+            (&set.scratch, D3D12_RESOURCE_STATE_COMMON),
+            at,
+            &set.src,
+            set.table_gpu,
+            (set.kind, set.stride, set.records()),
+        );
+    }
+    // SAFETY: as above.
+    unsafe {
+        l.ResourceBarrier(&[transition(
+            budget,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+    all
 }
 
 #[cfg(test)]
@@ -2002,5 +2228,23 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::*;
+
+    #[test]
+    fn gathered_records_must_fit_the_clamp() {
+        assert_eq!(gatherable(0x1000, 0x6d71550, (10, 12)), Some(0x6d71550));
+        assert_eq!(gatherable(0x1000, 0, (1, 20)), Some(0));
+        assert_eq!(gatherable(0x1000, 0x6d71552, (10, 12)), None);
+        assert_eq!(gatherable(0x1002, 0x40, (10, 12)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (10, 8)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (10, GATHER_STRIDE + 4)), None);
+        assert_eq!(gatherable(0x1000, 0x40, (7, 12)), None);
+        assert_eq!(gatherable(0x1000, 1 << 32, (10, 12)), None);
+        assert_eq!(gatherable(0x1000, u64::from(u32::MAX) - 3, (10, 12)), None);
     }
 }

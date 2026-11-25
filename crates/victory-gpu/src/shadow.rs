@@ -422,13 +422,20 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// and no other piece is. Ranges sent up lie close together (514 a frame
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+pub(crate) fn joined_piece_runs(runs: Vec<CardSpan>) -> Vec<CardSpan> {
+    joined_piece_runs_within(runs, 0)
+}
+
+/// Joins piece runs that touch or are separated by at most `max_gap` 64 KiB
+/// pieces (`VICTORY_CARD_REHASH_GAP`, default 4).
+pub(crate) fn joined_piece_runs_within(mut runs: Vec<CardSpan>, max_gap: u32) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+            Some(last) if run.first <= last.first.saturating_add(last.pieces).saturating_add(max_gap) => {
+                let end = (last.first + last.pieces).max(run.first + run.pieces);
+                last.pieces = end - last.first;
                 last.to = last.to.max(run.to);
             }
             _ => out.push(run),
@@ -3842,7 +3849,11 @@ fn overlaps_buffer(start: u64, len: u64) -> bool {
 /// A host copy in CPU-visible card memory (`D3D12_HEAP_TYPE_GPU_UPLOAD`,
 /// `crate::rebar`), if enabled, supported and within budget.
 fn rebar_copy(kind: crate::rebar::Kind, start: u64, len: u64, size: u64, window: bool) -> Option<Arc<Shadow>> {
-    if !crate::rebar::reserve(kind, size, false) {
+    // Small title buffers (`Kind::Buffer`) are snapshotted and diffed on the
+    // CPU after shader writes; reading write-combined GPU upload memory over
+    // PCIe stalls copy-back, so keep them in system RAM.
+    let cpu_read = kind == crate::rebar::Kind::Buffer;
+    if !crate::rebar::reserve(kind, size, cpu_read) {
         return None;
     }
     let Some((buffer, data)) = host()?.gpu_upload_buffer(size) else {

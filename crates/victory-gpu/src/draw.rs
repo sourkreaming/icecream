@@ -186,6 +186,20 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
+/// Whether single indirect records that miss their window are gathered for
+/// the list's prelude to clamp in one pass per buffer (`VICTORY_INDIRECT_GATHER=0`
+/// turns it off). Needs [`windows`].
+fn gathers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INDIRECT_GATHER").is_none_or(|v| v != "0") && windows();
+        if on {
+            tracing::info!("scattered indirect records gathered into prelude clamp passes (VICTORY_INDIRECT_GATHER=1)");
+        }
+        on
+    })
+}
+
 /// `VICTORY_INDIRECT_MERGE` (on by default, `=0` disables; needs [`windows`]):
 /// consecutive one-record indirect calls that read the next record of the
 /// same window, with the same pipeline, signature and bound state, are
@@ -1727,7 +1741,18 @@ impl State {
         // Reuse `cached_key` even for slots reported in `changed`: when the title
         // rewrites a slot with the same descriptor key, `mirror_buffer` returns
         // `Unchanged` in O(1) without re-resolving `buffer_copy`.
-        let slots: Vec<u32> = if cache.passes == 0 {
+        // Warm up the 64 buckets progressively (default 8 buckets/frame,
+        // overridable via `VICTORY_HEAP_WARMUP_BUCKETS`) instead of scanning
+        // all 80,000+ slots in a single frame-0 spike.
+        static WARMUP_BUCKETS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let warmup_step = (*WARMUP_BUCKETS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_WARMUP_BUCKETS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(8)
+        }))
+        .clamp(1, 64);
+        let slots: Vec<u32> = if cache.passes == 0 && warmup_step >= 64 {
             for b in 0..64 {
                 cache.buckets[b].clear();
                 cache.bucket_spans[b].clear();
@@ -1735,7 +1760,6 @@ impl State {
             dirty_buckets = u64::MAX;
             host.buffer_slots()
         } else {
-            let bucket = (cache.passes & 63) as usize;
             let mut batch: Vec<u32> = Vec::with_capacity(changed.len() + 2048);
             let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::with_capacity(changed.len());
             for index in changed {
@@ -1743,16 +1767,25 @@ impl State {
                     batch.push(index);
                 }
             }
-            let rolling = host.buffer_slots_bucket(bucket as u32);
-            let live_bucket: std::collections::HashSet<u32> = rolling.iter().copied().collect();
-            let before_len = cache.buckets[bucket].len();
-            cache.buckets[bucket].retain(|index, _| live_bucket.contains(index));
-            if cache.buckets[bucket].len() != before_len {
-                dirty_buckets |= 1u64 << bucket;
-            }
-            for index in rolling {
-                if seen.insert(index) {
-                    batch.push(index);
+            let buckets_this_pass = if (cache.passes as usize) * warmup_step < 64 {
+                let start = (cache.passes as usize) * warmup_step;
+                start..(start + warmup_step).min(64)
+            } else {
+                let b = (cache.passes & 63) as usize;
+                b..(b + 1)
+            };
+            for bucket in buckets_this_pass {
+                let rolling = host.buffer_slots_bucket(bucket as u32);
+                let live_bucket: std::collections::HashSet<u32> = rolling.iter().copied().collect();
+                let before_len = cache.buckets[bucket].len();
+                cache.buckets[bucket].retain(|index, _| live_bucket.contains(index));
+                if cache.buckets[bucket].len() != before_len {
+                    dirty_buckets |= 1u64 << bucket;
+                }
+                for index in rolling {
+                    if seen.insert(index) {
+                        batch.push(index);
+                    }
                 }
             }
             batch
@@ -2054,7 +2087,7 @@ impl State {
         // textures (a scene's first minutes) then drains in fewer frames.
         static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let per_frame: u64 = *PER_FRAME_MB.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(48)
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -2142,14 +2175,21 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10)
         }));
-        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // A long queue (a scene's first minutes) gets a bounded catch-up
+        // budget capped at 24 ms so streaming never causes multi-hundred-ms hitches;
+        // `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && due.len() >= 2000 {
+            (
+                per_frame.min(64 << 20),
+                span.max(std::time::Duration::from_millis(24)),
+            )
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2421,9 +2461,18 @@ impl State {
         self.dispatch_inner(list, x, y, z, flags);
     }
 
+    /// Whether the bound pipeline's shaders can store to buffers (or the
+    /// pipeline is unknown): such a draw may overwrite indirect arguments
+    /// and closes per-list argument gathering (`HostList::gather_close`).
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
     fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.flush_window(list);
+        list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2750,6 +2799,9 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.flush_window(list);
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3156,6 +3208,9 @@ impl State {
         first_instance: u32,
     ) {
         self.flush_window(list);
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3261,6 +3316,9 @@ impl State {
         first_instance: u32,
     ) {
         self.flush_window(list);
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3399,6 +3457,9 @@ impl State {
         } else if !windowed {
             self.flush_window(list);
         }
+        if !windowed {
+            list.gather_close();
+        }
         let joining = merge() && windowed && max == 1 && count.is_none();
         let (pipeline, epoch) = (self.pipeline, self.epoch);
         let this_call = |w: &Window| victory_core::batch::Call {
@@ -3433,9 +3494,19 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), w.scratch_offset + (offset - w.base)));
-        let (bounded, at) = match hit {
-            Some(hit) => hit,
-            None => {
+        let gathered = if hit.is_none() && windowed && gathers() {
+            crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride))
+        } else {
+            None
+        };
+        let used_gather = hit.is_none() && gathered.is_some();
+        let (bounded, at) = match (hit, gathered) {
+            (Some(hit), _) => hit,
+            (None, Some((scratch, at))) => {
+                args.refresh(list, arguments, len);
+                (scratch, at)
+            }
+            (None, None) => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
@@ -3499,7 +3570,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if self.window.is_none() && max > 0 {
+            if self.window.is_none() && !used_gather && max > 0 {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -3547,7 +3618,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        if self.window.is_none() && max > 0 {
+        if self.window.is_none() && !used_gather && max > 0 {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {

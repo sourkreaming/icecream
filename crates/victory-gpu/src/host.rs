@@ -816,6 +816,9 @@ pub(crate) struct HostList {
     /// grown to the largest indirect execution recorded on the list, with a
     /// 256-byte-aligned bump cursor reset in [`HostList::reset`].
     indirect_args: Mutex<Option<(ID3D12Resource, u64, u64)>>,
+    /// Scattered indirect records gathered per buffer for the list's prelude
+    /// (`crate::indirect::gather`).
+    gather: Mutex<Gather>,
     /// Device-local sub-allocator (`(buffer, gpu_addr, cap, used, in_read)`) for
     /// GPU-to-GPU staging copies from `Shadow` buffers (`gpu_copy_from_shadow`),
     /// avoiding CPU `defer_fill` / `WHY_READ` settles. Reset in [`HostList::reset`].
@@ -848,6 +851,23 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// What a list gathers for its prelude to clamp (`crate::indirect::gather`).
+#[derive(Default)]
+struct Gather {
+    /// Something recorded in the list may write arguments: no record is
+    /// gathered from here on.
+    closed: bool,
+    /// One set per argument buffer, kind and stride.
+    sets: Vec<crate::indirect::GatherSet>,
+    /// The budget words the gathered records are charged to.
+    budget: Option<ID3D12Resource>,
+    /// Scratch buffers of earlier recordings, kept for the next sets.
+    spare: Vec<ID3D12Resource>,
+}
+
+/// The most argument buffers a list gathers from.
+const GATHER_SETS: usize = 8;
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -1775,6 +1795,18 @@ fn rehash_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v != "0"))
 }
 
+/// Maximum gap (in 64 KiB pieces) bridged when coalescing card rehash runs
+/// (`VICTORY_CARD_REHASH_GAP=<n>`, default 4; 0 joins only touching pieces).
+fn rehash_gap() -> u32 {
+    static GAP: OnceLock<u32> = OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_REHASH_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4)
+    })
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -1897,6 +1929,28 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// Clears all per-recording entries while keeping container capacities so
+    /// repeated `HostList::reset` calls do not churn heap allocations.
+    fn clear(&mut self) {
+        if !self.uploads.is_empty() {
+            ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+            ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+            self.uploads.clear();
+            self.upload_bytes = 0;
+        }
+        self.copies.clear();
+        self.kept.clear();
+        self.refreshed.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.backs.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
+        self.budget_zeroed = false;
+        self.shadows.clear();
+        self.shadow_ptrs.clear();
     }
 }
 
@@ -3336,6 +3390,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                gather: Mutex::default(),
                 gpu_copy: Mutex::default(),
                 // Start dirty so the first barrier/clamp on a fresh list still synchronizes any
                 // UAV writes made by preceding command lists before clearing `uav_dirty`.
@@ -3653,8 +3708,12 @@ impl Host {
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // The same pieces in fewer passes (`rehash_runs` + `rehash_gap`).
+                        let runs = if rehash_runs() {
+                            crate::shadow::joined_piece_runs_within(runs, rehash_gap())
+                        } else {
+                            runs
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -5334,6 +5393,23 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         self.textures_back();
+        for set in self
+            .gather
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sets
+            .iter()
+            .filter(|s| s.records() > 0)
+        {
+            // SAFETY: an open list and a live scratch buffer left in INDIRECT_ARGUMENT by prelude.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    &set.scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5357,7 +5433,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         // Start dirty on reuse so the first barrier/clamp on this list synchronizes prior-list UAVs.
         self.set_uav_dirty(true);
         self.clamp_ran.store(false, Ordering::Relaxed);
@@ -5376,6 +5452,16 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let Gather { closed, sets, spare, .. } = &mut *gather;
+            *closed = false;
+            for set in sets.drain(..) {
+                if spare.len() < GATHER_SETS {
+                    spare.push(set.into_scratch());
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -5708,13 +5794,30 @@ impl HostList {
                 }
             }
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
-            let real = copy.state.swap(*last, Ordering::Relaxed);
-            let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
-        }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // Moves from the real states, then the list's states become the real ones.
+        let moves = || -> Vec<D3D12_RESOURCE_BARRIER> {
+            let mut out = barriers.clone();
+            out.extend(states.iter().filter_map(|(key, (first, _, copy))| {
+                let real = copy.state.load(Ordering::Relaxed);
+                let real = copying.get(key).copied().unwrap_or(real);
+                (real != *first)
+                    .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
+            }));
+            out
+        };
+        let left = || {
+            for (_, last, copy) in states.values() {
+                copy.state.store(*last, Ordering::Relaxed);
+            }
+        };
+        let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let gathered = gather.sets.iter().any(|s| s.records() > 0);
+        if !gathered
+            && syncs.is_empty()
+            && barriers.is_empty()
+            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
+        {
+            left();
             return None;
         }
         let Some((allocator, list)) = self
@@ -5725,7 +5828,7 @@ impl HostList {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures and gather buffers are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -5735,12 +5838,23 @@ impl HostList {
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
+                let final_barriers = moves();
+                if !final_barriers.is_empty() {
+                    list.ResourceBarrier(&final_barriers);
+                }
+                if gathered {
+                    let filled = match &gather.budget {
+                        Some(budget) => crate::indirect::record_gathers(list, &gather.sets, budget),
+                        None => false,
+                    };
+                    if !filled {
+                        fail(format_args!("a list's gathered indirect records could not be clamped in its prelude"));
+                    }
                 }
                 list.Close()
             })
         };
+        left();
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -6219,6 +6333,85 @@ impl HostList {
         self.deferred().refreshed.clear();
     }
 
+    /// From here on the list gathers no records (`crate::indirect::gather`):
+    /// what is about to be recorded may write arguments.
+    pub(crate) fn gather_close(&self) {
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+    }
+
+    /// A slot for the record at `offset` of host copy `src` in the scratch
+    /// buffer filled by the list's prelude (`crate::indirect::gather`).
+    pub(crate) fn gather_slot(
+        &self,
+        src: &ID3D12Resource,
+        src_id: u64,
+        offset: u32,
+        (kind, stride): (u32, u32),
+    ) -> Option<(ID3D12Resource, u64)> {
+        let none = |why: usize| {
+            crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if gather.closed {
+            return none(1);
+        }
+        let found = gather
+            .sets
+            .iter()
+            .position(|s| s.src_id == src_id && s.kind == kind && s.stride == stride && s.src.as_raw() == src.as_raw());
+        let at = match found {
+            Some(at) => at,
+            None => {
+                if gather.sets.len() >= GATHER_SETS {
+                    return none(2);
+                }
+                if self.list.cast::<ID3D12GraphicsCommandList2>().is_err() {
+                    return none(4);
+                }
+                let Some(host) = host() else {
+                    return none(4);
+                };
+                if gather.budget.is_none() {
+                    let Some(budget) = host.uav_buffer(256) else {
+                        return none(4);
+                    };
+                    name(&budget, || "indirect budget of gathered records".to_owned());
+                    gather.budget = Some(budget);
+                }
+                let scratch = match gather.spare.pop() {
+                    Some(scratch) => scratch,
+                    None => {
+                        let Some(scratch) = host.uav_buffer(
+                            u64::from(crate::indirect::GATHER_MOST) * u64::from(crate::indirect::GATHER_STRIDE),
+                        ) else {
+                            return none(4);
+                        };
+                        name(&scratch, || "indirect arguments, gathered".to_owned());
+                        scratch
+                    }
+                };
+                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
+                    gather.spare.push(scratch);
+                    return none(4);
+                };
+                gather.sets.push(crate::indirect::GatherSet::new(
+                    src.clone(),
+                    src_id,
+                    (kind, stride),
+                    scratch,
+                    table,
+                ));
+                gather.sets.len() - 1
+            }
+        };
+        let set = &mut gather.sets[at];
+        let Some(slot) = set.slot(offset) else {
+            return none(3);
+        };
+        Some((set.scratch.clone(), u64::from(slot) * u64::from(stride)))
+    }
+
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
@@ -6236,7 +6429,12 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        let mut wrote_pending: Vec<(usize, usize)> = Vec::new();
         for step in &self.deferred().copies {
+            if !matches!(step, Step::Copy(..)) && !wrote_pending.is_empty() {
+                crate::watch::wrote_many(&wrote_pending);
+                wrote_pending.clear();
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -6247,8 +6445,10 @@ impl HostList {
                     }
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
+                    // With the submission's one asking: batch consecutive copy notifications.
+                    if len > 0 {
+                        wrote_pending.push((dst, len));
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -6312,6 +6512,9 @@ impl HostList {
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        if !wrote_pending.is_empty() {
+            crate::watch::wrote_many(&wrote_pending);
         }
     }
 }

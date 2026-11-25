@@ -25,7 +25,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Mirrors `Journal::kept` so `wrote` / `wrote_many` can skip acquiring
+/// `JOURNAL` when no `ask_once` snapshot is active.
+static JOURNAL_KEPT: AtomicBool = AtomicBool::new(false);
 
 /// Disjoint, non-touching half-open intervals `[lo, hi)` (`lo < hi`), stored
 /// as `lo -> hi`. Lets [`Guards`] check a 174 MiB clean view heap in one
@@ -462,14 +466,19 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     j.kept = !j.ahead.is_empty() || !j.ahead_guarded.is_empty();
+    JOURNAL_KEPT.store(j.kept, Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    if !JOURNAL_KEPT.load(Ordering::Acquire) {
+        return;
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
+        JOURNAL_KEPT.store(false, Ordering::Release);
         j.ahead.clear();
         j.ahead_guarded.clear();
     }
@@ -478,9 +487,13 @@ pub(crate) fn ask_once_end() {
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
+#[allow(dead_code)]
 pub(crate) fn wrote(at: usize, len: usize) {
+    if len == 0 || !JOURNAL_KEPT.load(Ordering::Acquire) {
+        return;
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
+    if !j.kept {
         return;
     }
     j.asked += 1;
@@ -493,6 +506,30 @@ pub(crate) fn wrote(at: usize, len: usize) {
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+    }
+    j.last_write = j.last_write.max(now);
+}
+
+/// Batched form of [`wrote`] for consecutive title-memory copies: takes
+/// `JOURNAL` once for the whole batch instead of per copy.
+pub(crate) fn wrote_many(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() || !JOURNAL_KEPT.load(Ordering::Acquire) {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
+        return;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    j.ahead_asked = now;
+    for &(at, len) in ranges {
+        if len == 0 {
+            continue;
+        }
+        for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+            j.written.insert(page, now);
+        }
     }
     j.last_write = j.last_write.max(now);
 }
