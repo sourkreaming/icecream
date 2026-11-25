@@ -24,6 +24,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+#[path = "typed_views.rs"]
+mod typed_views;
 
 type Why = &'static str;
 
@@ -98,10 +100,18 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_program(parts, &[])
+}
+
+pub(super) fn lower_program(
+    parts: &Parts,
+    uint_srvs: &'static [(u8, u32, u32)],
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, uint_srvs).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -193,6 +203,8 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    /// (root slot, table offset in dwords, DXIL resource kind).
+    uint_srvs: &'static [(u8, u32, u32)],
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -1413,7 +1425,11 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        uint_srvs: &'static [(u8, u32, u32)],
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1670,6 +1686,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            uint_srvs,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -6161,14 +6178,24 @@ impl<'a> Lower<'a> {
                         5 => 7,
                         _ => return Err("an image dimension (cube or MSAA)"),
                     };
-                    ((kind | u, 0x409), Some(kind))
+                    let ty = if !uav && self.scalar_uint_srv(&src, kind) {
+                        0x105
+                    } else {
+                        0x409
+                    };
+                    ((kind | u, ty), Some(kind))
                 }
                 Fields::Buffer { idxen, format, .. } => {
                     let stride = used.map_or(0, |u| u.stride);
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        let ty = if !uav && self.scalar_uint_srv(&src, 10) {
+                            0x105
+                        } else {
+                            0x409
+                        };
+                        (10 | u, ty)
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                         (12 | u, stride)
                     } else {
@@ -6578,6 +6605,11 @@ impl<'a> Lower<'a> {
                         let max = self.s.m.f32((top as f32).to_bits());
                         self.s.m.bin(c, Bin::SDiv, f, max)
                     };
+                    // +top and above must return +1.0 (norm_quotient is only valid for a < d);
+                    // the two lowest values are -1.0.
+                    let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::SGE, s, high);
+                    let q = self.s.m.select(c, at_top, one, q);
                     let lo = self.s.m.f32((-1.0f32).to_bits());
                     let q = self.binary(35, q, lo);
                     float(self, q)
@@ -10140,7 +10172,15 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let uint = !uav
+            && !*d16
+            && *dmask == 1
+            && matches!(name, "image_load" | "image_gather4_lz")
+            && self.scalar_uint_srv(src, kind);
+        let props = (
+            kind | if uav { 0x1000 } else { 0 },
+            if uint { 0x105 } else { 0x409 },
+        );
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -10587,6 +10627,11 @@ impl<'a> Lower<'a> {
                     // DXIL Log already returns log2; a length of 0 gives
                     // minus infinity, which the sampler clamps to level 0.
                     let lod = self.unary(23, texels);
+                    let lod = if has_cl {
+                        self.binary(35, lod, clamp)
+                    } else {
+                        lod
+                    };
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -10730,11 +10775,12 @@ impl<'a> Lower<'a> {
                     } else {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
+                        let ret = self.resource_return_type(uint);
                         self.s.op(
                             c,
-                            "textureGather.f32",
+                            if uint { "textureGather.i32" } else { "textureGather.f32" },
                             Attr::ReadOnly,
-                            self.s.t.res_ret,
+                            ret,
                             73,
                             &args,
                         )
@@ -10758,11 +10804,12 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
+            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                "textureLoad.f32",
+                if uint { "textureLoad.i32" } else { "textureLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 66,
                 &args,
             )
@@ -11241,6 +11288,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let uint = name == "buffer_load_format_x" && !uav && self.scalar_uint_srv(src, 10);
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -11248,13 +11296,14 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let h = self.handle(site, src, false, (10 | u, if uint { 0x105 } else { 0x409 }))?;
             let index = index.unwrap_or(self.s.m.i32(0));
+            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                "bufferLoad.f32",
+                if uint { "bufferLoad.i32" } else { "bufferLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 68,
                 &[h, index, iu],
             )
@@ -11331,7 +11380,7 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            let x = if uint { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -11993,7 +12042,7 @@ mod tests {
     };
     use crate::{io, ir, resource, structure};
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
@@ -12167,6 +12216,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_wave_with_views(words, layout, used, wave64, &[])
+    }
+
+    pub(super) fn lower_wave_with_views(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        uint_srvs: &'static [(u8, u32, u32)],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -12186,21 +12245,24 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
+        super::lower_program(
+            &Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            },
+            uint_srvs,
+        )
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
-    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+    pub(super) fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
         RootParam {
             root,
             table_offset_dwords: 0,
@@ -12371,7 +12433,7 @@ mod tests {
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
-    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+    pub(super) fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
             kind,
             root: RootType::Table,

@@ -40,6 +40,24 @@ const VERTICES: u32 = 6;
 /// output components).
 const MAX_SCALARS: u32 = 1024;
 
+/// Which of a rectangle's three corners (x and y of each) holds the right
+/// angle: the one opposite the longest side, else (ties, NaN) `1`. The
+/// geometry shader of [`rect_list_gs`] makes the same choice on the GPU.
+pub fn right_angle(xy: [[f32; 2]; 3]) -> usize {
+    let side = |i: usize, j: usize| {
+        let (dx, dy) = (xy[i][0] - xy[j][0], xy[i][1] - xy[j][1]);
+        dx * dx + dy * dy
+    };
+    let (d12, d20, d01) = (side(1, 2), side(2, 0), side(0, 1));
+    if d12 > d20 && d12 > d01 {
+        0
+    } else if d01 > d12 && d01 > d20 {
+        2
+    } else {
+        1
+    }
+}
+
 /// The geometry shader (a DXIL container) for rectangle lists drawn with
 /// the translated vertex shader `vs` and, if the pipeline has one, the
 /// translated pixel shader `ps` (both as [`super::HostShader::dxil`]). Its
@@ -155,22 +173,30 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         let apart = not(&mut s, together);
         plain = both(&mut s, plain, apart);
     }
-    // corner[i]: vertex i is the corner between the other two (the first
-    // that shares x with one of them and y with the other).
-    let mut corner: Vec<V> = Vec::new();
-    for i in 0..3 {
-        let (a, c) = ((i + 1) % 3, (i + 2) % 3);
-        let (xa, yc) = (same(&mut s, x[i], x[a]), same(&mut s, y[i], y[c]));
-        let (xc, ya) = (same(&mut s, x[i], x[c]), same(&mut s, y[i], y[a]));
-        let (one, other) = (both(&mut s, xa, yc), both(&mut s, xc, ya));
-        let shares = either(&mut s, one, other);
-        let mut here = both(&mut s, shares, plain);
-        for &found in &corner {
-            let earlier = not(&mut s, found);
-            here = both(&mut s, here, earlier);
-        }
-        corner.push(here);
-    }
+    // corner[i]: vertex i is opposite the longest side (as `right_angle` picks it
+    // from screen position; ties and NaN pick vertex 1), when `plain`.
+    let side = |s: &mut Shader, i: usize, j: usize| {
+        let dx = s.m.bin(b, Bin::Sub, x[i], x[j]);
+        let dy = s.m.bin(b, Bin::Sub, y[i], y[j]);
+        let sx = s.m.bin(b, Bin::Mul, dx, dx);
+        let sy = s.m.bin(b, Bin::Mul, dy, dy);
+        s.m.bin(b, Bin::Add, sx, sy)
+    };
+    let (d12, d20, d01) = (side(&mut s, 1, 2), side(&mut s, 2, 0), side(&mut s, 0, 1));
+    let longest = |s: &mut Shader, d: V, o0: V, o1: V| {
+        let c0 = s.m.cmp(b, pred::OGT, d, o0);
+        let c1 = s.m.cmp(b, pred::OGT, d, o1);
+        both(s, c0, c1)
+    };
+    let at0 = longest(&mut s, d12, d20, d01);
+    let at2 = longest(&mut s, d01, d12, d20);
+    let not_one = either(&mut s, at0, at2);
+    let at1 = not(&mut s, not_one);
+    let corner = [
+        both(&mut s, at0, plain),
+        both(&mut s, at1, plain),
+        both(&mut s, at2, plain),
+    ];
 
     // What the six emitted vertices carry: [element][column][vertex].
     let mut emitted: Vec<Vec<[V; 6]>> = Vec::new();
@@ -277,6 +303,29 @@ fn either(s: &mut Shader, a: V, b: V) -> V {
 fn not(s: &mut Shader, a: V) -> V {
     let (entry, on) = (s.entry, s.m.bool(true));
     s.m.bin(entry, Bin::Xor, a, on)
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::right_angle;
+
+    /// The right angle is found wherever it is; triangles that are no
+    /// rectangle's take the corner opposite their longest side (their
+    /// widest angle), and ties and NaN keep the blits' corner, `v1`.
+    #[test]
+    fn right_angles_are_found_in_any_order() {
+        let (tl, bl, br, tr) = ([0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]);
+        assert_eq!(right_angle([tl, bl, br]), 1);
+        assert_eq!(right_angle([tl, bl, tr]), 0);
+        assert_eq!(right_angle([bl, tr, tl]), 2);
+        assert_eq!(
+            right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]),
+            2,
+            "obtuse at v2"
+        );
+        assert_eq!(right_angle([tl, tl, tl]), 1, "a point");
+        assert_eq!(right_angle([tl, [f32::NAN, 0.0], br]), 1);
+    }
 }
 
 #[cfg(test)]

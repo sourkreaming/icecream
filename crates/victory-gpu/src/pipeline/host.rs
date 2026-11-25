@@ -274,6 +274,12 @@ impl GraphicsState {
             && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
 
+    /// Whether these write depth or stencil only, with no colour targets
+    /// (shadow maps and depth prepasses supply later draws).
+    pub(crate) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0 && self.depth_format.0 != 0
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs

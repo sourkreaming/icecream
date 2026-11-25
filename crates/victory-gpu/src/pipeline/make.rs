@@ -236,6 +236,7 @@ const MAKING: u8 = 3;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,
+    early_depth: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
     screen_early: VecDeque<Arc<Pending>>,
     screen_requested: VecDeque<Arc<Pending>>,
@@ -245,6 +246,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             early: VecDeque::new(),
+            early_depth: VecDeque::new(),
             requested: VecDeque::new(),
             screen_early: VecDeque::new(),
             screen_requested: VecDeque::new(),
@@ -263,6 +265,13 @@ impl Queue {
             (true, true) => self.screen_requested.push_back(p.clone()),
             (true, false) => self.screen_early.push_back(p.clone()),
             (false, true) => self.requested.push_back(p.clone()),
+            (false, false)
+                if p.graphics
+                    .as_ref()
+                    .is_some_and(|state| state.writes_depth_only()) =>
+            {
+                self.early_depth.push_back(p.clone());
+            }
             (false, false) => self.early.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
@@ -275,7 +284,7 @@ impl Queue {
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         // Screen workers exclusively drain screen passes; ordinary workers drain
-        // requested passes (screen first, then all) before any early pass.
+        // requested passes (screen first, then all), then screen/depth early, then early.
         let p = if screen_only {
             self.screen_requested
                 .pop_front()
@@ -285,6 +294,7 @@ impl Queue {
                 .pop_front()
                 .or_else(|| self.requested.pop_front())
                 .or_else(|| take_early(&mut self.screen_early))
+                .or_else(|| take_early(&mut self.early_depth))
                 .or_else(|| take_early(&mut self.early))?
         };
         p.queue_state.store(MAKING, Ordering::Relaxed);

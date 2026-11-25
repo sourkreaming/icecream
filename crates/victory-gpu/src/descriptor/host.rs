@@ -430,6 +430,43 @@ pub(crate) fn page_written(at: usize, len: usize) {
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Keep the producer cheap while adjacent pages or repeated writes arrive.
+/// A full queue falls back to checking all tracked views once, so completed
+/// uploads are still invalidated when a remap arrives during a long pause.
+fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+    if start >= end {
+        return false;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.0 <= end
+        && start <= last.1
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+        return false;
+    }
+    if ranges.len() >= limit {
+        ranges.clear();
+        ranges.push((0, u64::MAX));
+        return true;
+    }
+    ranges.push((start, end));
+    false
+}
+
+/// Before looking up descriptor spans, merge notifications from interleaved
+/// producers. The consumer cares only which addresses changed in this batch.
+fn merge_remaps(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, previous| {
+        if next.0 > previous.1 {
+            return false;
+        }
+        previous.1 = previous.1.max(next.1);
+        true
+    });
+}
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -475,20 +512,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    if record_remap(&mut ranges, start, end, MOST) {
+        STALE[2].fetch_add(1, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -1309,10 +1335,11 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        merge_remaps(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()

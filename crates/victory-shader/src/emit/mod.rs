@@ -111,7 +111,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
-pub use rect::rect_list_gs;
+pub use rect::{rect_list_gs, right_angle};
 pub use shader::{
     MEMORY_DIRTY_DWORDS, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
     SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE,
@@ -661,6 +661,26 @@ fn widen(
     }
 }
 
+/// The tiled-lighting VS and six eye-lighting PS variants read scalar UINT
+/// masks and indices. These stripped programs have no bitcode or reflected
+/// component types. Bind the observed views by full input digest and exact
+/// root-table field. Other fields in these very shaders hold float textures.
+pub(crate) fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
+    // DXIL resource kinds 2 = Texture2D, 4 = Texture3D, 10 = TypedBuffer.
+    const DIRECTIONAL_EYE: &[(u8, u32, u32)] =
+        &[(0, 32, 10), (0, 968, 2), (0, 1160, 2), (1, 72, 2), (1, 80, 4)];
+    match u128::from_be_bytes(digest) {
+        0x8386ec5b_47a3b2de_49309239_7987b35d => &[(1, 48, 2), (1, 56, 2)],
+        0x46545633_f601b707_19765403_267442c5
+        | 0xa3c6e3b5_a1226f1b_3b08afe2_ac7b6c3d
+        | 0x58795ccc_1d3237cf_683a8a7a_a88391fd => DIRECTIONAL_EYE,
+        0x56d5f614_619f530c_f1cf2b90_43b580e8
+        | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
+        | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
+        _ => &[],
+    }
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -733,17 +753,20 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    let l = lower::lower_program(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        tiled_lighting_uint_srvs(c.digest),
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
