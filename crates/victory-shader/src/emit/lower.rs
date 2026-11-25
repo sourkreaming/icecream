@@ -6572,26 +6572,31 @@ impl<'a> Lower<'a> {
                 l.s.m.bin(c, Bin::AShr, t, k)
             };
             let f32t = self.s.t.f32;
+            static EXACT_NORM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let exact = *EXACT_NORM.get_or_init(|| {
+                std::env::var_os("VICTORY_EXACT_NORM").is_some_and(|v| v == "1")
+            });
             let x = match numeric {
                 Numeric::Unorm => {
                     let top = (1u64 << w) - 1;
-                    let q = if w <= 16 {
+                    let q = if exact && w <= 16 {
                         let q = self.norm_quotient(field, w);
-                        self.as_float(q)
+                        let q = self.as_float(q);
+                        let (high, one) =
+                            (self.s.m.i32(top as u32), self.s.m.f32(1.0f32.to_bits()));
+                        let at_top = self.s.m.cmp(c, pred::EQ, field, high);
+                        self.s.m.select(c, at_top, one, q)
                     } else {
                         let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
                         let max = self.s.m.f32((top as f32).to_bits());
                         self.s.m.bin(c, Bin::SDiv, f, max)
                     };
-                    let (high, one) = (self.s.m.i32(top as u32), self.s.m.f32(1.0f32.to_bits()));
-                    let at_top = self.s.m.cmp(c, pred::EQ, field, high);
-                    let q = self.s.m.select(c, at_top, one, q);
                     float(self, q)
                 }
                 Numeric::Snorm => {
                     let s = signed(self);
                     let top = (1u32 << (w - 1)) - 1;
-                    let q = if w <= 17 {
+                    let q = if exact && w <= 17 {
                         let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
                         let neg = self.s.m.cmp(c, pred::SLT, s, zero);
                         let minus = self.s.m.bin(c, Bin::Sub, zero, s);
@@ -6599,17 +6604,16 @@ impl<'a> Lower<'a> {
                         let q = self.norm_quotient(m, w - 1);
                         let sign = self.s.m.select(c, neg, sign, zero);
                         let q = self.s.m.bin(c, Bin::Or, q, sign);
-                        self.as_float(q)
+                        let q = self.as_float(q);
+                        // +top and above must return +1.0 (norm_quotient is only valid for a < d).
+                        let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
+                        let at_top = self.s.m.cmp(c, pred::SGE, s, high);
+                        self.s.m.select(c, at_top, one, q)
                     } else {
                         let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
                         let max = self.s.m.f32((top as f32).to_bits());
                         self.s.m.bin(c, Bin::SDiv, f, max)
                     };
-                    // +top and above must return +1.0 (norm_quotient is only valid for a < d);
-                    // the two lowest values are -1.0.
-                    let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
-                    let at_top = self.s.m.cmp(c, pred::SGE, s, high);
-                    let q = self.s.m.select(c, at_top, one, q);
                     let lo = self.s.m.f32((-1.0f32).to_bits());
                     let q = self.binary(35, q, lo);
                     float(self, q)
